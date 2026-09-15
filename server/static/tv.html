@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Titán TV - Reproductor Web OnPlay</title>
+    <script src="https://cdn.jsdelivr.net/npm/mpegts.js@latest/dist/mpegts.js"></script>
+    <style>
+        :root {
+            --bg-main: #0d1117;
+            --bg-card: #161b22;
+            --bg-hover: #21262d;
+            --accent: #00d26a;
+            --accent-blue: #0070f3;
+            --text-main: #f0f6fc;
+            --text-muted: #8b949e;
+            --border: #30363d;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+        body { background: var(--bg-main); color: var(--text-main); display: flex; height: 100vh; overflow: hidden; }
+        
+        /* Sidebar */
+        .sidebar {
+            width: 360px;
+            background: var(--bg-card);
+            border-right: 1px solid var(--border);
+            display: flex;
+            flex-direction: column;
+            height: 100%;
+        }
+        .sidebar-header {
+            padding: 16px;
+            border-bottom: 1px solid var(--border);
+        }
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-size: 1.2rem;
+            font-weight: 700;
+            color: var(--accent);
+            margin-bottom: 12px;
+        }
+        .search-box {
+            width: 100%;
+            padding: 10px 14px;
+            background: var(--bg-main);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            color: #fff;
+            font-size: 0.95rem;
+            outline: none;
+        }
+        .search-box:focus { border-color: var(--accent-blue); }
+        
+        .categories {
+            display: flex;
+            gap: 6px;
+            padding: 10px 16px;
+            overflow-x: auto;
+            border-bottom: 1px solid var(--border);
+            white-space: nowrap;
+        }
+        .categories::-webkit-scrollbar { height: 4px; }
+        .categories::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+        .cat-btn {
+            background: var(--bg-main);
+            color: var(--text-muted);
+            border: 1px solid var(--border);
+            padding: 5px 12px;
+            border-radius: 20px;
+            font-size: 0.8rem;
+            cursor: pointer;
+            transition: 0.2s;
+        }
+        .cat-btn.active, .cat-btn:hover {
+            background: var(--accent-blue);
+            color: #fff;
+            border-color: var(--accent-blue);
+        }
+        
+        .channel-list {
+            flex: 1;
+            overflow-y: auto;
+            padding: 8px;
+        }
+        .channel-list::-webkit-scrollbar { width: 6px; }
+        .channel-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+        
+        .channel-item {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 10px 14px;
+            border-radius: 8px;
+            cursor: pointer;
+            margin-bottom: 4px;
+            transition: background 0.15s;
+        }
+        .channel-item:hover { background: var(--bg-hover); }
+        .channel-item.active {
+            background: rgba(0, 112, 243, 0.2);
+            border-left: 4px solid var(--accent-blue);
+        }
+        .channel-left {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        .channel-num {
+            font-weight: 700;
+            color: var(--accent);
+            font-size: 0.95rem;
+            min-width: 28px;
+        }
+        .channel-title {
+            font-weight: 500;
+            font-size: 0.95rem;
+        }
+        .channel-cat {
+            font-size: 0.72rem;
+            color: var(--text-muted);
+            background: var(--bg-main);
+            padding: 2px 8px;
+            border-radius: 12px;
+        }
+        
+        /* Main Player */
+        .main-area {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            background: #000;
+            position: relative;
+        }
+        .player-header {
+            padding: 12px 24px;
+            background: rgba(22, 27, 34, 0.85);
+            backdrop-filter: blur(10px);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            z-index: 10;
+        }
+        .current-ch-title {
+            font-size: 1.1rem;
+            font-weight: 600;
+            color: #fff;
+        }
+        .status-badge {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 0.8rem;
+            color: var(--accent);
+            background: rgba(0, 210, 106, 0.15);
+            padding: 4px 10px;
+            border-radius: 16px;
+        }
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            background: var(--accent);
+            border-radius: 50%;
+            animation: pulse 1.5s infinite;
+        }
+        @keyframes pulse {
+            0% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.4; transform: scale(1.2); }
+            100% { opacity: 1; transform: scale(1); }
+        }
+        
+        .video-container {
+            flex: 1;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: #000;
+            position: relative;
+        }
+        video {
+            width: 100%;
+            height: 100%;
+            max-height: 100vh;
+            background: #000;
+        }
+        
+        .loading-overlay {
+            position: absolute;
+            display: none;
+            flex-direction: column;
+            align-items: center;
+            gap: 12px;
+            color: #fff;
+            font-size: 1.1rem;
+        }
+        .spinner {
+            width: 44px;
+            height: 44px;
+            border: 4px solid rgba(255,255,255,0.2);
+            border-top-color: var(--accent-blue);
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+    </style>
+</head>
+<body>
+
+<div class="sidebar">
+    <div class="sidebar-header">
+        <div class="brand">
+            <span>⚡ Titán TV</span>
+            <span style="font-size: 0.8rem; color: var(--text-muted); font-weight: normal;">• OnPlay Live</span>
+        </div>
+        <input type="text" id="searchBox" class="search-box" placeholder="🔍 Buscar canal (ej: ESPN, TyC, Telefe)...">
+    </div>
+    
+    <div class="categories" id="catBar">
+        <button class="cat-btn active" onclick="filterCategory('TODOS')">Todos (97)</button>
+        <button class="cat-btn" onclick="filterCategory('DEPORTES')">⚽ Deportes</button>
+        <button class="cat-btn" onclick="filterCategory('AIRE Y NOTICIAS')">📺 Aire / Noticias</button>
+        <button class="cat-btn" onclick="filterCategory('CINE Y SERIES')">🎬 Cine y Series</button>
+        <button class="cat-btn" onclick="filterCategory('INFANTILES')">🧸 Infantiles</button>
+        <button class="cat-btn" onclick="filterCategory('DOCUMENTALES')">🌍 Documentales</button>
+    </div>
+    
+    <div class="channel-list" id="channelList">
+        <!-- Generado dinámicamente -->
+    </div>
+</div>
+
+<div class="main-area">
+    <div class="player-header">
+        <div class="current-ch-title" id="currentChName">15. ESPN Premium HD</div>
+        <div class="status-badge">
+            <span class="status-dot"></span> EN VIVO
+        </div>
+    </div>
+    <div class="video-container">
+        <div class="loading-overlay" id="loadingOverlay">
+            <div class="spinner"></div>
+            <div>Cargando transmisión en vivo...</div>
+        </div>
+        <video id="videoElement" controls autoplay></video>
+    </div>
+</div>
+
+<script>
+    const channels = [{"title": "America TV HD", "chno": null, "group": "AIRE Y NOTICIAS", "raw": "#EXTINF:-1 tvg-id=\"AmericaTV.ar\" tvg-name=\"America TV HD\" group-title=\"AIRE Y NOTICIAS\",America TV HD", "url": "http://10.248.248.2:8000/cv-americatv"}, {"title": "TV Publica HD", "chno": null, "group": "AIRE Y NOTICIAS", "raw": "#EXTINF:-1 tvg-id=\"TVPublica.ar\" tvg-name=\"TV Publica HD\" group-title=\"AIRE Y NOTICIAS\",TV Publica HD", "url": "http://10.248.248.2:8000/cv-tvpublica"}, {"title": "Canal 9 HD", "chno": null, "group": "AIRE Y NOTICIAS", "raw": "#EXTINF:-1 tvg-id=\"ElNueve.ar\" tvg-name=\"Canal 9 HD\" group-title=\"AIRE Y NOTICIAS\",Canal 9 HD", "url": "http://10.248.248.2:8000/cv-canal9"}, {"title": "Telefe", "chno": null, "group": "AIRE Y NOTICIAS", "raw": "#EXTINF:-1 tvg-id=\"Telefe.ar\" tvg-name=\"Telefe\" group-title=\"AIRE Y NOTICIAS\",Telefe", "url": "http://10.248.248.2:8000/cv-telefe"}, {"title": "Canal 13 HD", "chno": null, "group": "AIRE Y NOTICIAS", "raw": "#EXTINF:-1 tvg-id=\"ElTrece.ar\" tvg-name=\"Canal 13 HD\" group-title=\"AIRE Y NOTICIAS\",Canal 13 HD", "url": "http://10.248.248.2:8000/cv-canal13"}, {"title": "TN", "chno": null, "group": "AIRE Y NOTICIAS", "raw": "#EXTINF:-1 tvg-id=\"TN.ar\" tvg-name=\"TN\" group-title=\"AIRE Y NOTICIAS\",TN", "url": "http://10.248.248.2:8000/cv-tn"}, {"title": "C5N", "chno": null, "group": "AIRE Y NOTICIAS", "raw": "#EXTINF:-1 tvg-id=\"C5N.ar\" tvg-name=\"C5N\" group-title=\"AIRE Y NOTICIAS\",C5N", "url": "http://10.248.248.2:8000/cv-c5n"}, {"title": "Cronica TV", "chno": null, "group": "AIRE Y NOTICIAS", "raw": "#EXTINF:-1 tvg-id=\"CronicaTV.ar\" tvg-name=\"Cronica TV\" group-title=\"AIRE Y NOTICIAS\",Cronica TV", "url": "http://10.248.248.2:8000/cv-cronica"}, {"title": "A 24", "chno": null, "group": "AIRE Y NOTICIAS", "raw": "#EXTINF:-1 tvg-id=\"A24.ar\" tvg-name=\"A 24\" group-title=\"AIRE Y NOTICIAS\",A 24", "url": "http://10.248.248.2:8000/cv-a24"}, {"title": "La Nacion HD", "chno": null, "group": "AIRE Y NOTICIAS", "raw": "#EXTINF:-1 tvg-id=\"LaNacionPlus.ar\" tvg-name=\"La Nacion HD\" group-title=\"AIRE Y NOTICIAS\",La Nacion HD", "url": "http://10.248.248.2:8000/cv-lanacion"}, {"title": "26 TV", "chno": null, "group": "AIRE Y NOTICIAS", "raw": "#EXTINF:-1 tvg-id=\"Canal26.ar\" tvg-name=\"26 TV\" group-title=\"AIRE Y NOTICIAS\",26 TV", "url": "http://10.248.248.2:8000/cv-26tv"}, {"title": "NET TV", "chno": null, "group": "AIRE Y NOTICIAS", "raw": "#EXTINF:-1 tvg-id=\"NETTV.ar\" tvg-name=\"NET TV\" group-title=\"AIRE Y NOTICIAS\",NET TV", "url": "http://10.248.248.2:8000/cv-nettv"}, {"title": "Argentina 12", "chno": null, "group": "AIRE Y NOTICIAS", "raw": "#EXTINF:-1 tvg-id=\"Argentina12.ar\" tvg-name=\"Argentina 12\" group-title=\"AIRE Y NOTICIAS\",Argentina 12", "url": "http://10.248.248.2:8000/cv-ip"}, {"title": "Canal de la Ciudad", "chno": null, "group": "AIRE Y NOTICIAS", "raw": "#EXTINF:-1 tvg-id=\"CanaldelaCiudad.ar\" tvg-name=\"Canal de la Ciudad\" group-title=\"AIRE Y NOTICIAS\",Canal de la Ciudad", "url": "http://10.248.248.2:8000/cv-ciudad"}, {"title": "ESPN Premium HD", "chno": null, "group": "DEPORTES", "raw": "#EXTINF:-1 tvg-id=\"ESPNPremium.ar\" tvg-name=\"ESPN Premium HD\" group-title=\"DEPORTES\",ESPN Premium HD", "url": "http://10.248.248.2:8000/espn-premium"}, {"title": "TNT Sports HD", "chno": null, "group": "DEPORTES", "raw": "#EXTINF:-1 tvg-id=\"TNTSports.ar\" tvg-name=\"TNT Sports HD\" group-title=\"DEPORTES\",TNT Sports HD", "url": "http://10.248.248.2:8000/tnt-sports"}, {"title": "TYC Sports HD", "chno": null, "group": "DEPORTES", "raw": "#EXTINF:-1 tvg-id=\"TyCSports.ar\" tvg-name=\"TYC Sports HD\" group-title=\"DEPORTES\",TYC Sports HD", "url": "http://10.248.248.2:8000/cv-tyc"}, {"title": "ESPN HD", "chno": null, "group": "DEPORTES", "raw": "#EXTINF:-1 tvg-id=\"ESPNLatinAmerica.us\" tvg-name=\"ESPN HD\" group-title=\"DEPORTES\",ESPN HD", "url": "http://10.248.248.2:8000/cv-espn"}, {"title": "ESPN 2 HD", "chno": null, "group": "DEPORTES", "raw": "#EXTINF:-1 tvg-id=\"ESPN2LatinAmerica.us\" tvg-name=\"ESPN 2 HD\" group-title=\"DEPORTES\",ESPN 2 HD", "url": "http://10.248.248.2:8000/cv-espn2"}, {"title": "ESPN 3 HD", "chno": null, "group": "DEPORTES", "raw": "#EXTINF:-1 tvg-id=\"ESPN3LatinAmerica.us\" tvg-name=\"ESPN 3 HD\" group-title=\"DEPORTES\",ESPN 3 HD", "url": "http://10.248.248.2:8000/cv-espn3"}, {"title": "Fox Sports HD", "chno": null, "group": "DEPORTES", "raw": "#EXTINF:-1 tvg-id=\"FoxSports.ar\" tvg-name=\"Fox Sports HD\" group-title=\"DEPORTES\",Fox Sports HD", "url": "http://10.248.248.2:8000/cv-foxsports"}, {"title": "Fox Sports 2 HD", "chno": null, "group": "DEPORTES", "raw": "#EXTINF:-1 tvg-id=\"FoxSports2.ar\" tvg-name=\"Fox Sports 2 HD\" group-title=\"DEPORTES\",Fox Sports 2 HD", "url": "http://10.248.248.2:8000/cv-foxsports2"}, {"title": "Fox Sports 3 HD", "chno": null, "group": "DEPORTES", "raw": "#EXTINF:-1 tvg-id=\"FoxSports3LatinAmerica.us\" tvg-name=\"Fox Sports 3 HD\" group-title=\"DEPORTES\",Fox Sports 3 HD", "url": "http://10.248.248.2:8000/cv-foxsports3"}, {"title": "DXTV", "chno": null, "group": "DEPORTES", "raw": "#EXTINF:-1 tvg-id=\"DXTV.ar\" tvg-name=\"DXTV\" group-title=\"DEPORTES\",DXTV", "url": "http://10.248.248.2:8000/cv-deportv"}, {"title": "America Sports", "chno": null, "group": "DEPORTES", "raw": "#EXTINF:-1 tvg-id=\"AmericaSports.ar\" tvg-name=\"America Sports\" group-title=\"DEPORTES\",America Sports", "url": "http://10.248.248.2:8000/america-sports"}, {"title": "El Garage", "chno": null, "group": "DEPORTES", "raw": "#EXTINF:-1 tvg-id=\"GarageTVLatinAmerica.ar\" tvg-name=\"El Garage\" group-title=\"DEPORTES\",El Garage", "url": "http://10.248.248.2:8000/cv-elgarage"}, {"title": "ESPN 4 HD", "chno": null, "group": "DEPORTES", "raw": "#EXTINF:-1 tvg-id=\"ESPN4LatinAmerica.us\" tvg-name=\"ESPN 4 HD\" group-title=\"DEPORTES\",ESPN 4 HD", "url": "http://10.248.248.2:8000/cv-espn4"}, {"title": "Cartoon Network", "chno": null, "group": "INFANTILES", "raw": "#EXTINF:-1 tvg-id=\"CartoonNetworkLatinAmerica.us\" tvg-name=\"Cartoon Network\" group-title=\"INFANTILES\",Cartoon Network", "url": "http://10.248.248.2:8000/cv-cartoon"}, {"title": "Nickelodeon", "chno": null, "group": "INFANTILES", "raw": "#EXTINF:-1 tvg-id=\"NickelodeonLatinAmerica.us\" tvg-name=\"Nickelodeon\" group-title=\"INFANTILES\",Nickelodeon", "url": "http://10.248.248.2:8000/cv-nick"}, {"title": "Discovery Kids", "chno": null, "group": "INFANTILES", "raw": "#EXTINF:-1 tvg-id=\"DiscoveryKidsLatinAmerica.us\" tvg-name=\"Discovery Kids\" group-title=\"INFANTILES\",Discovery Kids", "url": "http://10.248.248.2:8000/cv-dkids"}, {"title": "Disney Channel HD", "chno": null, "group": "INFANTILES", "raw": "#EXTINF:-1 tvg-id=\"DisneyChannelLatinAmerica.ar\" tvg-name=\"Disney Channel HD\" group-title=\"INFANTILES\",Disney Channel HD", "url": "http://10.248.248.2:8000/cv-disney"}, {"title": "Disney Jr", "chno": null, "group": "INFANTILES", "raw": "#EXTINF:-1 tvg-id=\"DisneyJrLatinAmerica.ar\" tvg-name=\"Disney Jr\" group-title=\"INFANTILES\",Disney Jr", "url": "http://10.248.248.2:8000/cv-disneyjr"}, {"title": "Paka Paka", "chno": null, "group": "INFANTILES", "raw": "#EXTINF:-1 tvg-id=\"Pakapaka.ar\" tvg-name=\"Paka Paka\" group-title=\"INFANTILES\",Paka Paka", "url": "http://10.248.248.2:8000/cv-pakapaka"}, {"title": "HTV", "chno": null, "group": "MUSICA Y VARIEDADES", "raw": "#EXTINF:-1 tvg-id=\"HTV.us\" tvg-name=\"HTV\" group-title=\"MUSICA Y VARIEDADES\",HTV", "url": "http://10.248.248.2:8000/htv"}, {"title": "MTV", "chno": null, "group": "MUSICA Y VARIEDADES", "raw": "#EXTINF:-1 tvg-id=\"MTVLatinAmerica.us\" tvg-name=\"MTV\" group-title=\"MUSICA Y VARIEDADES\",MTV", "url": "http://10.248.248.2:8000/cv-mtv"}, {"title": "Quiero Musica", "chno": null, "group": "MUSICA Y VARIEDADES", "raw": "#EXTINF:-1 tvg-id=\"QuieroMusicaenmiIdioma.ar\" tvg-name=\"Quiero Musica\" group-title=\"MUSICA Y VARIEDADES\",Quiero Musica", "url": "http://10.248.248.2:8000/cv-quiero"}, {"title": "Canal a", "chno": null, "group": "MUSICA Y VARIEDADES", "raw": "#EXTINF:-1 tvg-id=\"CanalA.ar\" tvg-name=\"Canal a\" group-title=\"MUSICA Y VARIEDADES\",Canal a", "url": "http://10.248.248.2:8000/cv-canala"}, {"title": "KZO", "chno": null, "group": "MUSICA Y VARIEDADES", "raw": "#EXTINF:-1 tvg-id=\"KZO.ar\" tvg-name=\"KZO\" group-title=\"MUSICA Y VARIEDADES\",KZO", "url": "http://10.248.248.2:8000/cv-kzo"}, {"title": "Metro HD", "chno": null, "group": "MUSICA Y VARIEDADES", "raw": "#EXTINF:-1 tvg-id=\"Metro.ar\" tvg-name=\"Metro HD\" group-title=\"MUSICA Y VARIEDADES\",Metro HD", "url": "http://10.248.248.2:8000/cv-metro"}, {"title": "Canal Rural", "chno": null, "group": "MUSICA Y VARIEDADES", "raw": "#EXTINF:-1 tvg-id=\"CanalRural.ar\" tvg-name=\"Canal Rural\" group-title=\"MUSICA Y VARIEDADES\",Canal Rural", "url": "http://10.248.248.2:8000/cv-canalrural"}, {"title": "RAI", "chno": null, "group": "MUSICA Y VARIEDADES", "raw": "#EXTINF:-1 tvg-id=\"RAI.it\" tvg-name=\"RAI\" group-title=\"MUSICA Y VARIEDADES\",RAI", "url": "http://10.248.248.2:8000/cv-rai"}, {"title": "Bravo", "chno": null, "group": "VARIEDADES", "raw": "#EXTINF:-1 tvg-id=\"BravoTV.ar\" tvg-name=\"Bravo\" group-title=\"VARIEDADES\",Bravo", "url": "http://10.248.248.2:8000/cv-bravo"}, {"title": "Somos", "chno": null, "group": "VARIEDADES", "raw": "#EXTINF:-1 tvg-id=\"Somos.ar\" tvg-name=\"Somos\" group-title=\"VARIEDADES\",Somos", "url": "http://10.248.248.2:8000/cv-somos"}, {"title": "TVE", "chno": null, "group": "INTERNACIONALES", "raw": "#EXTINF:-1 tvg-id=\"TVEInternacionalAmerica.es\" tvg-name=\"TVE\" group-title=\"INTERNACIONALES\",TVE", "url": "http://10.248.248.2:8000/cv-tve"}, {"title": "HBO", "chno": null, "group": "CINE Y SERIES", "raw": "#EXTINF:-1 tvg-id=\"HBOLatinAmerica.us\" tvg-name=\"HBO\" group-title=\"CINE Y SERIES\",HBO", "url": "http://10.248.248.2:8000/hbo"}, {"title": "HBO Signature", "chno": null, "group": "CINE Y SERIES", "raw": "#EXTINF:-1 tvg-id=\"HBOSignatureLatinAmerica.us\" tvg-name=\"HBO Signature\" group-title=\"CINE Y SERIES\",HBO Signature", "url": "http://10.248.248.2:8000/hbo-signature"}, {"title": "HBO Xtreme", "chno": null, "group": "CINE Y SERIES", "raw": "#EXTINF:-1 tvg-id=\"HBOXtremeLatinAmerica.us\" tvg-name=\"HBO Xtreme\" group-title=\"CINE Y SERIES\",HBO Xtreme", "url": "http://10.248.248.2:8000/hbo-xtreme"}, {"title": "Star Channel", "chno": null, "group": "CINE Y SERIES", "raw": "#EXTINF:-1 tvg-id=\"StarChannelLatinAmerica.us\" tvg-name=\"Star Channel\" group-title=\"CINE Y SERIES\",Star Channel", "url": "http://10.248.248.2:8000/cv-star"}, {"title": "TNT HD", "chno": null, "group": "CINE Y SERIES", "raw": "#EXTINF:-1 tvg-id=\"TNTLatinAmerica.us\" tvg-name=\"TNT HD\" group-title=\"CINE Y SERIES\",TNT HD", "url": "http://10.248.248.2:8000/cv-tnt"}, {"title": "TNT Series", "chno": null, "group": "CINE Y SERIES", "raw": "#EXTINF:-1 tvg-id=\"TNTSeriesLatinAmerica.us\" tvg-name=\"TNT Series\" group-title=\"CINE Y SERIES\",TNT Series", "url": "http://10.248.248.2:8000/cv-tntseries"}, {"title": "TNT Novelas", "chno": null, "group": "CINE Y SERIES", "raw": "#EXTINF:-1 tvg-id=\"TNTNovelas.ar\" tvg-name=\"TNT Novelas\" group-title=\"CINE Y SERIES\",TNT Novelas", "url": "http://10.248.248.2:8000/cv-tntnovelas"}, {"title": "Sony", "chno": null, "group": "CINE Y SERIES", "raw": "#EXTINF:-1 tvg-id=\"SonyChannelAndes.us\" tvg-name=\"Sony\" group-title=\"CINE Y SERIES\",Sony", "url": "http://10.248.248.2:8000/cv-sony"}, {"title": "AXN", "chno": null, "group": "CINE Y SERIES", "raw": "#EXTINF:-1 tvg-id=\"AXNLatinAmerica.us\" tvg-name=\"AXN\" group-title=\"CINE Y SERIES\",AXN", "url": "http://10.248.248.2:8000/cv-axn"}, {"title": "Warner Channel", "chno": null, "group": "CINE Y SERIES", "raw": "#EXTINF:-1 tvg-id=\"WarnerChannel.us\" tvg-name=\"Warner Channel\" group-title=\"CINE Y SERIES\",Warner Channel", "url": "http://10.248.248.2:8000/cv-warner"}, {"title": "FX", "chno": null, "group": "CINE Y SERIES", "raw": "#EXTINF:-1 tvg-id=\"FXLatinAmerica.us\" tvg-name=\"FX\" group-title=\"CINE Y SERIES\",FX", "url": "http://10.248.248.2:8000/cv-fx"}, {"title": "Cinecanal", "chno": null, "group": "CINE Y SERIES", "raw": "#EXTINF:-1 tvg-id=\"Cinecanal.us\" tvg-name=\"Cinecanal\" group-title=\"CINE Y SERIES\",Cinecanal", "url": "http://10.248.248.2:8000/cv-cinecanal"}, {"title": "Cinemax", "chno": null, "group": "CINE Y SERIES", "raw": "#EXTINF:-1 tvg-id=\"CinemaxLatinAmerica.us\" tvg-name=\"Cinemax\" group-title=\"CINE Y SERIES\",Cinemax", "url": "http://10.248.248.2:8000/cv-cinemax"}, {"title": "Cine AR", "chno": null, "group": "CINE Y SERIES", "raw": "#EXTINF:-1 tvg-id=\"CineAr.ar\" tvg-name=\"Cine AR\" group-title=\"CINE Y SERIES\",Cine AR", "url": "http://10.248.248.2:8000/cv-cinear"}, {"title": "Space", "chno": null, "group": "CINE Y SERIES", "raw": "#EXTINF:-1 tvg-id=\"Space.ar\" tvg-name=\"Space\" group-title=\"CINE Y SERIES\",Space", "url": "http://10.248.248.2:8000/cv-space"}, {"title": "TCM", "chno": null, "group": "CINE Y SERIES", "raw": "#EXTINF:-1 tvg-id=\"TCMLatinAmerica.us\" tvg-name=\"TCM\" group-title=\"CINE Y SERIES\",TCM", "url": "http://10.248.248.2:8000/cv-tcm"}, {"title": "Studio Universal", "chno": null, "group": "CINE Y SERIES", "raw": "#EXTINF:-1 tvg-id=\"StudioUniversalLatinAmerica.us\" tvg-name=\"Studio Universal\" group-title=\"CINE Y SERIES\",Studio Universal", "url": "http://10.248.248.2:8000/cv-studiouniversal"}, {"title": "AMC", "chno": null, "group": "CINE Y SERIES", "raw": "#EXTINF:-1 tvg-id=\"AMCLatinAmerica.us\" tvg-name=\"AMC\" group-title=\"CINE Y SERIES\",AMC", "url": "http://10.248.248.2:8000/cv-amc"}, {"title": "A&E", "chno": null, "group": "CINE Y SERIES", "raw": "#EXTINF:-1 tvg-id=\"AELatinAmerica.us\" tvg-name=\"A&E\" group-title=\"CINE Y SERIES\",A&E", "url": "http://10.248.248.2:8000/cv-ae"}, {"title": "Film and Arts", "chno": null, "group": "CINE Y SERIES", "raw": "#EXTINF:-1 tvg-id=\"FilmArts.ar\" tvg-name=\"Film and Arts\" group-title=\"CINE Y SERIES\",Film and Arts", "url": "http://10.248.248.2:8000/cv-filmarts"}, {"title": "Volver", "chno": null, "group": "CINE Y SERIES", "raw": "#EXTINF:-1 tvg-id=\"Volver.ar\" tvg-name=\"Volver\" group-title=\"CINE Y SERIES\",Volver", "url": "http://10.248.248.2:8000/cv-volver"}, {"title": "Telemundo HD", "chno": null, "group": "CINE Y SERIES", "raw": "#EXTINF:-1 tvg-id=\"TelemundoInternacional.us\" tvg-name=\"Telemundo HD\" group-title=\"CINE Y SERIES\",Telemundo HD", "url": "http://10.248.248.2:8000/cv-telemundo"}, {"title": "Discovery HD", "chno": null, "group": "DOCUMENTALES Y ESTILO DE VIDA", "raw": "#EXTINF:-1 tvg-id=\"DiscoveryChannelLatinAmerica.us\" tvg-name=\"Discovery HD\" group-title=\"DOCUMENTALES Y ESTILO DE VIDA\",Discovery HD", "url": "http://10.248.248.2:8000/cv-discovery"}, {"title": "Discovery Theater HD", "chno": null, "group": "DOCUMENTALES Y ESTILO DE VIDA", "raw": "#EXTINF:-1 tvg-id=\"DiscoveryTheaterLatinAmerica.us\" tvg-name=\"Discovery Theater HD\" group-title=\"DOCUMENTALES Y ESTILO DE VIDA\",Discovery Theater HD", "url": "http://10.248.248.2:8000/discovery-theater"}, {"title": "Discovery World HD", "chno": null, "group": "DOCUMENTALES Y ESTILO DE VIDA", "raw": "#EXTINF:-1 tvg-id=\"DiscoveryWorld.us\" tvg-name=\"Discovery World HD\" group-title=\"DOCUMENTALES Y ESTILO DE VIDA\",Discovery World HD", "url": "http://10.248.248.2:8000/discovery-world"}, {"title": "Discovery Science", "chno": null, "group": "DOCUMENTALES Y ESTILO DE VIDA", "raw": "#EXTINF:-1 tvg-id=\"DiscoveryScienceLatinAmerica.us\" tvg-name=\"Discovery Science\" group-title=\"DOCUMENTALES Y ESTILO DE VIDA\",Discovery Science", "url": "http://10.248.248.2:8000/discovery-science"}, {"title": "Discovery Home and Health", "chno": null, "group": "DOCUMENTALES Y ESTILO DE VIDA", "raw": "#EXTINF:-1 tvg-id=\"DiscoveryHomeHealthLatinAmerica.mx\" tvg-name=\"Discovery Home and Health\" group-title=\"DOCUMENTALES Y ESTILO DE VIDA\",Discovery Home and Health", "url": "http://10.248.248.2:8000/cv-hh"}, {"title": "Discovery ID", "chno": null, "group": "DOCUMENTALES Y ESTILO DE VIDA", "raw": "#EXTINF:-1 tvg-id=\"InvestigationDiscoveryLatinAmerica.us\" tvg-name=\"Discovery ID\" group-title=\"DOCUMENTALES Y ESTILO DE VIDA\",Discovery ID", "url": "http://10.248.248.2:8000/cv-id"}, {"title": "National Geographic", "chno": null, "group": "DOCUMENTALES Y ESTILO DE VIDA", "raw": "#EXTINF:-1 tvg-id=\"NationalGeographicLatinAmerica.us\" tvg-name=\"National Geographic\" group-title=\"DOCUMENTALES Y ESTILO DE VIDA\",National Geographic", "url": "http://10.248.248.2:8000/cv-natgeo"}, {"title": "History HD", "chno": null, "group": "DOCUMENTALES Y ESTILO DE VIDA", "raw": "#EXTINF:-1 tvg-id=\"HistoryLatinAmerica.us\" tvg-name=\"History HD\" group-title=\"DOCUMENTALES Y ESTILO DE VIDA\",History HD", "url": "http://10.248.248.2:8000/cv-history"}, {"title": "History 2", "chno": null, "group": "DOCUMENTALES Y ESTILO DE VIDA", "raw": "#EXTINF:-1 tvg-id=\"History2LatinAmerica.us\" tvg-name=\"History 2\" group-title=\"DOCUMENTALES Y ESTILO DE VIDA\",History 2", "url": "http://10.248.248.2:8000/cv-history2"}, {"title": "Encuentro", "chno": null, "group": "DOCUMENTALES Y ESTILO DE VIDA", "raw": "#EXTINF:-1 tvg-id=\"Encuentro.ar\" tvg-name=\"Encuentro\" group-title=\"DOCUMENTALES Y ESTILO DE VIDA\",Encuentro", "url": "http://10.248.248.2:8000/cv-encuentro"}, {"title": "Animal Planet", "chno": null, "group": "DOCUMENTALES Y ESTILO DE VIDA", "raw": "#EXTINF:-1 tvg-id=\"AnimalPlanetLatinAmerica.us\" tvg-name=\"Animal Planet\" group-title=\"DOCUMENTALES Y ESTILO DE VIDA\",Animal Planet", "url": "http://10.248.248.2:8000/cv-animalplanet"}, {"title": "El Gourmet", "chno": null, "group": "DOCUMENTALES Y ESTILO DE VIDA", "raw": "#EXTINF:-1 tvg-id=\"ElGourmet.ar\" tvg-name=\"El Gourmet\" group-title=\"DOCUMENTALES Y ESTILO DE VIDA\",El Gourmet", "url": "http://10.248.248.2:8000/cv-gourmet"}, {"title": "Ciudad Magazine", "chno": null, "group": "DOCUMENTALES Y ESTILO DE VIDA", "raw": "#EXTINF:-1 tvg-id=\"CiudadMagazine.ar\" tvg-name=\"Ciudad Magazine\" group-title=\"DOCUMENTALES Y ESTILO DE VIDA\",Ciudad Magazine", "url": "http://10.248.248.2:8000/cv-ciudadmagazine"}, {"title": "MIX TV", "chno": null, "group": "DOCUMENTALES Y ESTILO DE VIDA", "raw": "#EXTINF:-1 tvg-id=\"MIXTV.ar\" tvg-name=\"MIX TV\" group-title=\"DOCUMENTALES Y ESTILO DE VIDA\",MIX TV", "url": "http://10.248.248.2:8000/cv-tlc"}, {"title": "Lifetime", "chno": null, "group": "DOCUMENTALES Y ESTILO DE VIDA", "raw": "#EXTINF:-1 tvg-id=\"LifetimeLatinAmerica.us\" tvg-name=\"Lifetime\" group-title=\"DOCUMENTALES Y ESTILO DE VIDA\",Lifetime", "url": "http://10.248.248.2:8000/cv-lifetime"}, {"title": "E! Entertainment", "chno": null, "group": "DOCUMENTALES Y ESTILO DE VIDA", "raw": "#EXTINF:-1 tvg-id=\"ELatinAmerica.us\" tvg-name=\"E! Entertainment\" group-title=\"DOCUMENTALES Y ESTILO DE VIDA\",E! Entertainment", "url": "http://10.248.248.2:8000/cv-e"}, {"title": "CNN Español", "chno": null, "group": "NOTICIAS Y INTERES GENERAL", "raw": "#EXTINF:-1 tvg-id=\"CNNenEspanol.us\" tvg-name=\"CNN Español\" group-title=\"NOTICIAS Y INTERES GENERAL\",CNN Español", "url": "http://10.248.248.2:8000/cv-cnnesp"}, {"title": "Comedy Central HD", "chno": null, "group": "ENTRETENIMIENTO Y GENERAL", "raw": "#EXTINF:-1 tvg-id=\"ComedyCentralLatinAmerica.us\" tvg-name=\"Comedy Central HD\" group-title=\"ENTRETENIMIENTO Y GENERAL\",Comedy Central HD", "url": "http://10.248.248.2:8000/cv-comedy"}, {"title": "Universal Channel HD", "chno": null, "group": "PELICULAS Y SERIES", "raw": "#EXTINF:-1 tvg-id=\"UniversalTVLatinAmerica.us\" tvg-name=\"Universal Channel HD\" group-title=\"PELICULAS Y SERIES\",Universal Channel HD", "url": "http://10.248.248.2:8000/cv-universal"}, {"title": "DSports", "chno": null, "group": "DEPORTES", "raw": "#EXTINF:-1 tvg-id=\"DSports.us\" group-title=\"DEPORTES\",DSports", "url": "http://10.248.248.2:8000/lnv-dsports"}, {"title": "DSports 2", "chno": null, "group": "DEPORTES", "raw": "#EXTINF:-1 tvg-id=\"DSports2.us\" group-title=\"DEPORTES\",DSports 2", "url": "http://10.248.248.2:8000/lnv-dsports-2"}, {"title": "Tigo Sports", "chno": null, "group": "DEPORTES", "raw": "#EXTINF:-1 tvg-id=\"TigoSports.py\" group-title=\"DEPORTES\",Tigo Sports", "url": "http://10.248.248.2:8000/lnv-tigo-sports"}, {"title": "Tigo Sports +", "chno": null, "group": "DEPORTES", "raw": "#EXTINF:-1 tvg-id=\"TigoSportsPlus.py\" group-title=\"DEPORTES\",Tigo Sports +", "url": "http://10.248.248.2:8000/lnv-tigo-sports-plus"}, {"title": "SNT", "chno": null, "group": "PARAGUAY", "raw": "#EXTINF:-1 tvg-id=\"SNT.py\" group-title=\"PARAGUAY\",SNT", "url": "http://10.248.248.2:8000/lnv-snt"}, {"title": "Telefuturo", "chno": null, "group": "PARAGUAY", "raw": "#EXTINF:-1 tvg-id=\"Telefuturo.py\" group-title=\"PARAGUAY\",Telefuturo", "url": "http://10.248.248.2:8000/lnv-telefuturo"}, {"title": "La Tele", "chno": null, "group": "PARAGUAY", "raw": "#EXTINF:-1 tvg-id=\"LaTelePy.lnv\" group-title=\"PARAGUAY\",La Tele", "url": "http://10.248.248.2:8000/lnv-la-tele"}, {"title": "C9N", "chno": null, "group": "PARAGUAY", "raw": "#EXTINF:-1 tvg-id=\"C9N.py\" group-title=\"PARAGUAY\",C9N", "url": "http://10.248.248.2:8000/lnv-c9n"}, {"title": "Canal 13 (Py)", "chno": null, "group": "PARAGUAY", "raw": "#EXTINF:-1 tvg-id=\"Canal13Py.lnv\" group-title=\"PARAGUAY\",Canal 13 (Py)", "url": "http://10.248.248.2:8000/lnv-canal-13-py"}, {"title": "Pasiones", "chno": null, "group": "CINE Y SERIES", "raw": "#EXTINF:-1 tvg-id=\"PasionesLatinAmerica.us\" group-title=\"CINE Y SERIES\",Pasiones", "url": "http://10.248.248.2:8000/lnv-pasiones"}, {"title": "Telenovelas", "chno": null, "group": "CINE Y SERIES", "raw": "#EXTINF:-1 tvg-id=\"TlnovelasLatinAmerica.mx\" group-title=\"CINE Y SERIES\",Telenovelas", "url": "http://10.248.248.2:8000/lnv-telenovelas"}, {"title": "Allegro", "chno": null, "group": "MUSICA Y VARIEDADES", "raw": "#EXTINF:-1 tvg-id=\"AllegroHD.ar\" group-title=\"MUSICA Y VARIEDADES\",Allegro", "url": "http://10.248.248.2:8000/lnv-allegro"}];
+    let currentCategory = 'TODOS';
+    let player = null;
+    let currentActiveNum = 15;
+
+    function renderChannels(query = '') {
+        const container = document.getElementById('channelList');
+        container.innerHTML = '';
+        const q = query.toLowerCase().trim();
+
+        channels.forEach((ch, idx) => {
+            const num = idx + 1;
+            const title = ch.title || 'Canal ' + num;
+            const group = ch.group || 'GENERAL';
+
+            // Filtro por categoría
+            if (currentCategory !== 'TODOS') {
+                if (!group.toUpperCase().includes(currentCategory)) return;
+            }
+
+            // Filtro por texto
+            if (q) {
+                const matchNum = num.toString() === q;
+                const matchTitle = title.toLowerCase().includes(q);
+                const matchGroup = group.toLowerCase().includes(q);
+                if (!matchNum && !matchTitle && !matchGroup) return;
+            }
+
+            const item = document.createElement('div');
+            item.className = 'channel-item' + (num === currentActiveNum ? ' active' : '');
+            item.onclick = () => playChannel(num, title, ch.url);
+
+            item.innerHTML = `
+                <div class="channel-left">
+                    <span class="channel-num">${num}</span>
+                    <span class="channel-title">${title}</span>
+                </div>
+                <span class="channel-cat">${group.split(' ')[0]}</span>
+            `;
+            container.appendChild(item);
+        });
+    }
+
+    function filterCategory(cat) {
+        currentCategory = cat;
+        document.querySelectorAll('.cat-btn').forEach(btn => {
+            btn.classList.toggle('active', btn.textContent.includes(cat) || (cat === 'TODOS' && btn.textContent.includes('Todos')));
+        });
+        renderChannels(document.getElementById('searchBox').value);
+    }
+
+    function playChannel(num, title, url) {
+        currentActiveNum = num;
+        document.getElementById('currentChName').textContent = `${num}. ${title}`;
+        document.querySelectorAll('.channel-item').forEach(el => el.classList.remove('active'));
+        renderChannels(document.getElementById('searchBox').value);
+
+        const videoElement = document.getElementById('videoElement');
+        const loader = document.getElementById('loadingOverlay');
+        loader.style.display = 'flex';
+
+        if (player) {
+            player.pause();
+            player.unload();
+            player.detachMediaElement();
+            player.destroy();
+            player = null;
+        }
+
+        if (mpegts.getFeatureList().mseLivePlayback) {
+            player = mpegts.createPlayer({
+                type: 'mse',
+                isLive: true,
+                url: url
+            }, {
+                enableWorker: true,
+                lazyLoad: false,
+                liveBufferLatencyChasing: true,
+                liveBufferLatencyMaxLatency: 3.0,
+                liveBufferLatencyMinRemain: 0.8
+            });
+
+            player.attachMediaElement(videoElement);
+            player.load();
+            
+            player.on(mpegts.Events.ERROR, (errType, errDetail) => {
+                console.error("Error reproduciendo:", errType, errDetail);
+                loader.style.display = 'none';
+            });
+
+            videoElement.onplaying = () => {
+                loader.style.display = 'none';
+            };
+
+            player.play().catch(e => {
+                console.log("Autoplay esperando interacción del usuario");
+                loader.style.display = 'none';
+            });
+        } else {
+            alert('Tu navegador no soporta MediaSource Extensions (MSE).');
+            loader.style.display = 'none';
+        }
+    }
+
+    document.getElementById('searchBox').addEventListener('input', (e) => {
+        renderChannels(e.target.value);
+    });
+
+    // Iniciar automáticamente en ESPN Premium (Canal 15)
+    window.addEventListener('DOMContentLoaded', () => {
+        renderChannels();
+        const espn = channels[14];
+        if (espn) {
+            playChannel(15, espn.title, espn.url);
+        }
+    });
+</script>
+
+</body>
+</html>

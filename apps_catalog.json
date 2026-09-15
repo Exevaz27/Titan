@@ -1,0 +1,19 @@
+{
+  "descripcion": "Catálogo de ejecutables y programas portables. Podés agregar acá cualquier app con un alias simple.",
+  "apps": {
+    "inkscape": "E:\\Programas\\Inkscape\\bin\\inkscape.exe",
+    "bloc de notas": "C:\\Windows\\notepad.exe",
+    "calculadora": "calc.exe",
+    "cmd": "cmd.exe",
+    "powershell": "powershell.exe",
+    "explorador": "explorer.exe",
+    "brave": "C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\brave.exe",
+    "youtube": "C:\\Users\\Exevaz27\\Desktop\\YouTube.lnk",
+    "spotify": "C:\\Users\\Exevaz27\\AppData\\Roaming\\Spotify\\Spotify.exe"
+  },
+  "carpetas_escaneo_portable": [
+    "E:\\Programas",
+    "C:\\Portables",
+    "D:\\Portables"
+  ]
+}

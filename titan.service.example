@@ -1,0 +1,18 @@
+[Unit]
+Description=Titan - nucleo central del asistente
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=REEMPLAZAR_USUARIO
+WorkingDirectory=/opt/titan
+EnvironmentFile=/opt/titan/.env
+ExecStart=/opt/titan/.venv/bin/python /opt/titan/main.py
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

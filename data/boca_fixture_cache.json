@@ -1,0 +1,17 @@
+{
+  "last_update": 1789140974.8338304,
+  "fixture": {
+    "id": 1493125,
+    "date_iso": "2026-09-11T21:30:00",
+    "date_display": "HOY Viernes 11/9 a las 21:30 hs",
+    "league": "Liga Profesional Argentina",
+    "round": "Clausura - 9",
+    "rival": "Central Cordoba de Santiago",
+    "condition": "Local",
+    "stadium": "Estadio Alberto J. Armando",
+    "referee": null,
+    "status": "Not Started",
+    "status_short": "NS",
+    "lineups": []
+  }
+}

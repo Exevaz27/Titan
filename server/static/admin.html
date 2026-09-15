@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Dispositivos autorizados - Titan</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; background: #111827; color: #f9fafb; }
+    h1 { margin-bottom: .25rem; }
+    .muted { color: #9ca3af; }
+    section { background: #1f2937; padding: 1rem; margin: 1rem 0; border-radius: 8px; }
+    input, select, button { padding: .65rem; margin: .25rem; border-radius: 5px; border: 1px solid #4b5563; }
+    input, select { background: #111827; color: #fff; }
+    button { cursor: pointer; background: #2563eb; color: white; border: 0; }
+    button.danger { background: #dc2626; }
+    li { margin: .6rem 0; }
+    code { color: #93c5fd; word-break: break-all; }
+    #pairing { display: none; margin-top: 1rem; padding: 1rem; background: #111827; border-radius: 6px; }
+    #qr { max-width: 240px; background: white; padding: .5rem; }
+    .wide { width: min(100%, 560px); }
+    #pairingLink { display: block; padding: .75rem; background: #030712; color: #93c5fd; word-break: break-all; user-select: all; }
+    #message { min-height: 1.5rem; color: #fbbf24; }
+  </style>
+</head>
+<body>
+  <h1>Dispositivos de Titán</h1>
+  <p class="muted">Este gestor funciona en la DDR3. La autorización se guarda localmente.</p>
+  <div id="message"></div>
+  <section>
+    <h2>Autorizar dispositivo</h2>
+    <input id="deviceId" placeholder="ej. hud-celular">
+    <input id="baseUrl" class="wide" placeholder="Dirección para el celular, ej. http://192.168.100.5:8000">
+    <label>Tipo de dispositivo:
+      <select id="deviceRole">
+        <option value="api">Celular / HUD</option>
+        <option value="satellite">PC Windows</option>
+      </select>
+    </label>
+    <button onclick="enroll()">Autorizar</button>
+    <div id="pairing">
+      <p><strong>Listo.</strong> En el celular abrí el enlace. También podés mantenerlo presionado para copiarlo.</p>
+      <img id="qr" alt="QR de emparejamiento">
+      <p><button onclick="copyPairing()">Copiar enlace</button> <button id="downloadButton" onclick="downloadSatelliteConfig()" style="display:none">Descargar configuración Windows</button></p>
+      <a id="pairingLink" target="_blank" rel="noopener"></a>
+      <p id="copyHelp" class="muted"></p>
+      <p id="pairingCode" class="muted"></p>
+      <p class="muted">El enlace contiene la autorización. No lo compartas.</p>
+    </div>
+  </section>
+  <section>
+    <h2>Dispositivos registrados</h2>
+    <ul id="registered"><li>Cargando...</li></ul>
+  </section>
+  <section>
+    <h2>Conectados ahora</h2>
+    <ul id="connected"><li>Cargando...</li></ul>
+  </section>
+<script>
+const message = document.getElementById('message');
+let lastPairing = null;
+function show(text) { message.textContent = text; }
+async function load() {
+  const response = await fetch('/api/admin/devices');
+  if (!response.ok) { show('No autorizado o servidor no disponible.'); return; }
+  const data = await response.json();
+  document.getElementById('registered').innerHTML = Object.entries(data.registered).map(([id, d]) =>
+    `<li><strong>${id}</strong> - ${d.enabled ? 'activo' : 'revocado'} - ${d.roles.join(', ')} ${d.enabled ? `<button class="danger" onclick="revoke('${id}')">Revocar</button>` : ''}</li>`).join('') || '<li>Ninguno</li>';
+  document.getElementById('connected').innerHTML = data.connected.map(d =>
+    `<li><strong>${d.device_id || 'sin identificar'}</strong> - ${d.role || 'cliente'} - ${d.hostname || ''} - ${d.host || ''}</li>`).join('') || '<li>Ninguno</li>';
+}
+async function enroll() {
+  const roles = [document.getElementById('deviceRole').value];
+  const device_id = document.getElementById('deviceId').value.trim();
+  const base_url = document.getElementById('baseUrl').value.trim() || window.location.origin;
+  const response = await fetch('/api/admin/devices/enroll', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({device_id, roles, base_url}) });
+  const data = await response.json();
+  if (!response.ok) { show(data.detail || 'No se pudo autorizar.'); return; }
+  const fallbackUrl = `${base_url.replace(/\/$/, '')}/?device_id=${encodeURIComponent(device_id)}&token=${encodeURIComponent(data.token || '')}`;
+  lastPairing = Object.assign({}, data, { pairing_url: data.pairing_url || fallbackUrl });
+  document.getElementById('pairing').style.display = 'block';
+  document.getElementById('pairingLink').href = lastPairing.pairing_url;
+  document.getElementById('pairingLink').textContent = lastPairing.pairing_url || 'No se pudo generar el enlace';
+  document.getElementById('qr').style.display = data.qr_data_uri ? 'block' : 'none';
+  if (data.qr_data_uri) document.getElementById('qr').src = data.qr_data_uri;
+  document.getElementById('copyHelp').textContent = data.qr_data_uri ? 'También podés usar el QR.' : 'QR no disponible en este momento. Usá el enlace de arriba.';
+  document.getElementById('pairingCode').textContent = data.pairing_code ? `En el celular abrí ${base_url}/pair y escribí este código: ${data.pairing_code}` : '';
+  document.getElementById('downloadButton').style.display = roles.includes('satellite') ? 'inline-block' : 'none';
+  show('Dispositivo autorizado.');
+  load();
+}
+async function copyPairing() {
+  if (!lastPairing || !lastPairing.pairing_url) return;
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(lastPairing.pairing_url);
+    } else {
+      const helper = document.createElement('textarea');
+      helper.value = lastPairing.pairing_url;
+      helper.style.position = 'fixed';
+      helper.style.opacity = '0';
+      document.body.appendChild(helper);
+      helper.focus();
+      helper.select();
+      document.execCommand('copy');
+      helper.remove();
+    }
+    show('Enlace copiado. Pegalo o abrilo en el celular.');
+  } catch (error) {
+    show('Mantené presionado el enlace azul para copiarlo manualmente.');
+  }
+}
+function downloadSatelliteConfig() {
+  if (!lastPairing) return;
+  const host = new URL(lastPairing.pairing_url).host;
+  const content = `TITAN_SERVER_HOST=${host.split(':')[0]}\nTITAN_SERVER_PORT=${new URL(lastPairing.pairing_url).port || '8000'}\nTITAN_DEVICE_ID=${lastPairing.device_id}\nTITAN_SATELLITE_TOKEN=${lastPairing.token}\n`;
+  const blob = new Blob([content], {type: 'text/plain'});
+  const link = document.createElement('a');
+  link.href = URL.createObjectURL(blob);
+  link.download = 'titan-satellite.env';
+  link.click();
+  URL.revokeObjectURL(link.href);
+}
+async function revoke(id) {
+  if (!confirm(`¿Revocar ${id}?`)) return;
+  const response = await fetch(`/api/admin/devices/${encodeURIComponent(id)}/revoke`, {method: 'POST'});
+  show(response.ok ? 'Dispositivo revocado.' : 'No se pudo revocar.');
+  load();
+}
+load();
+setInterval(load, 5000);
+</script>
+</body>
+</html>

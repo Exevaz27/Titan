@@ -1,0 +1,4 @@
+# Entrada principal: Titán se ejecuta en la PC Linux DDR3.
+# Para instalar el satélite Windows, usar requirements-windows.txt.
+-r requirements-linux.txt
+

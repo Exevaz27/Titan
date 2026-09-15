@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Conectar Titán</title>
+  <style>
+    body { font-family: sans-serif; text-align: center; padding: 2rem 1rem; background: #111827; color: white; }
+    main { max-width: 360px; margin: auto; }
+    input, button { box-sizing: border-box; width: 100%; padding: 1rem; margin-top: 1rem; font-size: 1.2rem; border-radius: 6px; }
+    input { text-align: center; letter-spacing: .35rem; background: #030712; color: white; border: 1px solid #4b5563; }
+    button { background: #2563eb; color: white; border: 0; }
+    #message { color: #fbbf24; min-height: 2rem; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Conectar con Titán</h1>
+    <p>Escribí el código que aparece en la PC DDR3.</p>
+    <form id="pairForm">
+      <input id="code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code" placeholder="000000" required>
+      <button type="submit">Conectar</button>
+    </form>
+    <p id="message"></p>
+  </main>
+<script>
+document.getElementById('pairForm').addEventListener('submit', async function(event) {
+  event.preventDefault();
+  const message = document.getElementById('message');
+  const code = document.getElementById('code').value.trim();
+  message.textContent = 'Conectando...';
+  try {
+    const response = await fetch('/api/pair/claim', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({code})
+    });
+    if (response.redirected) {
+      window.location.href = response.url;
+      return;
+    }
+    const data = await response.json();
+    message.textContent = data.detail || 'Código inválido o vencido.';
+  } catch (error) {
+    message.textContent = 'No se pudo conectar con Titán.';
+  }
+});
+</script>
+</body>
+</html>

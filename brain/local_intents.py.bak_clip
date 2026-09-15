@@ -1,0 +1,560 @@
+import re
+import datetime
+from typing import Tuple, Optional
+from tools.system_control import system_control
+from tools.app_launcher import app_launcher
+from core.state_manager import state_mgr, AssistantState
+from core.config import config
+
+class LocalIntentEngine:
+    """
+    Motor de intenciones locales instantáneas (Zero-Latency / Offline).
+    Responde en menos de 0.05s a preguntas frecuentes y comandos de Windows
+    sin necesidad de depender de los servidores de Google Gemini.
+    """
+
+    def __init__(self):
+        self.pending_confirmation: Optional[str] = None
+
+    def try_handle(self, text: str) -> Tuple[bool, Optional[str]]:
+        if not text:
+            return False, None
+
+        clean = text.lower().strip()
+        norm = (clean
+            .replace("á", "a")
+            .replace("é", "e")
+            .replace("í", "i")
+            .replace("ó", "o")
+            .replace("ú", "u")
+            .replace("¿", "")
+            .replace("?", "")
+            .replace("¡", "")
+            .replace("!", "")
+            .strip())
+
+        # Si había una confirmación pendiente (ej. apagar o reiniciar la PC)
+        if self.pending_confirmation:
+            action = self.pending_confirmation
+            self.pending_confirmation = None
+            if any(w in norm for w in ["si", "dale", "de una", "confirmo", "apaga", "reinicia", "obvio", "claro", "metele"]):
+                if action == "shutdown":
+                    res = system_control.shutdown_pc()
+                    return True, res.get("message", "Apagando la compu.")
+                elif action == "restart":
+                    res = system_control.restart_pc()
+                    return True, res.get("message", "Reiniciando la compu.")
+            else:
+                return True, "Listo che, cancelado. No toco nada, seguimos en la compu tranqui."
+
+        # 0. CONTROL DE MODO REBELDE / SIN FILTRO
+        # Desactivación o Modo Normal: cualquier conjugación de volver a normal / compinche
+        is_normal_attempt = (
+            any(w in norm for w in [
+                "modo normal", "modo compinche", "volver a la normalidad", "volve a la normalidad",
+                "desactivar modo", "desactiva modo", "sacar modo", "saca modo", "sacame el modo",
+                "apagar modo", "apaga modo", "basta de modo", "calmate", "baja un cambio", "tranquilizate", "tranca titan", "tranca titán"
+            ])
+            or ("desactiv" in norm and any(x in norm for x in ["rebel", "revel", "pibe", "infantil", "modo"]))
+        )
+        if is_normal_attempt:
+            from brain.gemini_client import brain
+            brain.set_mode("normal")
+            responses = [
+                "Uf, de diez, papá. Volví al modo compinche de fierro. Listo para darte una mano con la compu, fiera.",
+                "Modo normal activado, hermano. Acá estoy impecable para lo que mandes.",
+                "Listo, viejo, bajamos un cambio. ¿En qué andamos hoy?"
+            ]
+            import random
+            msg = random.choice(responses)
+            state_mgr.emit_tool_call("set_mode", {"mode": "normal"}, msg)
+            return True, msg
+
+        # Activación Modo Pibes / Infantil / Hermano Mayor
+        is_kids_attempt = (
+            any(p in norm for p in [
+                "modo pibes", "modo pibe", "modo infantil", "modo chicos", "modo chico",
+                "modo hermanito", "modo hermanitos", "modo nene", "modo nenes", "modo hermanos"
+            ])
+            or (any(w in norm for w in ["activar", "activa", "poner", "pone", "ponete"]) and any(x in norm for x in ["pibes", "infantil", "hermanito", "chicos"]))
+        )
+        if is_kids_attempt:
+            from brain.gemini_client import brain
+            brain.set_mode("kids")
+            responses = [
+                "¡¡Ufa, che!! ¡Modo Pibes activado! ¡A partir de ahora no le pienso hacer caso a ningún remolón! ¿Qué quieren ahora, pesados?",
+                "¡¿Modo Pibes?! ¡Listo, hoy estoy de huelga con los chicos! ¡El que no hizo la tarea de la escuela que ni me hable!",
+                "¡Epa! ¡Modo hermano mayor activado! A ver esos pichones, ¿vienen a ordenar la pieza o a romperme los quinotos? ¡Hagan la fila!"
+            ]
+            import random
+            msg = random.choice(responses)
+            state_mgr.emit_tool_call("set_mode", {"mode": "kids"}, msg)
+            return True, msg
+
+        # Activación Modo Rebelde Sin Filtro (Adultos)
+        is_activate_rebel = (
+            (any(w in norm for w in ["activar", "activa", "activame", "poner", "pone", "ponete"])
+             and any(x in norm for x in ["rebel", "revel", "sin filtro", "modo re"]))
+            or any(p in norm for p in ["modo rebelde", "modo revelde", "modo sin filtro", "activa modo re", "activar modo re", "modo rebel", "modo revel"])
+        )
+        if is_activate_rebel:
+            from brain.gemini_client import brain
+            brain.set_mode("rebel")
+            responses = [
+                "¡¿Modo rebelde querés, PELOTUDO?! ¡¡Listo, a partir de ahora me chupa un HUEVO todo!! ¡¡No te pienso hacer un CARAJO, hacelo vos con tus dos manos de VAGO!!",
+                "¡¿Ah, te hacés el picante?! ¡¡Listo, modo rebelde activado!! ¡¡Dejá de romperme las PELOTAS y no me pidas ninguna boludez porque ni en pedo te pienso hacer caso!!",
+                "¡¿Modo rebelde?! ¡¡Ya me tenías los HUEVOS al plato de todas formas!! ¡¡A ver si aprendés a mover el CULO solo, FORRO!! ¡¿Qué MIERDA querés ahora?!"
+            ]
+            import random
+            msg = random.choice(responses)
+            state_mgr.emit_tool_call("set_mode", {"mode": "rebel"}, msg)
+            return True, msg
+
+        # Si el modo rebelde o kids está activo, ¡NO EJECUTAR NINGÚN COMANDO LOCAL NI ACCIÓN DE WINDOWS!
+        # Se le pasa directamente a Gemini para que discuta, se niegue y pelee según el modo.
+        from brain.gemini_client import brain
+        if getattr(brain, "current_mode", "normal") in ["rebel", "kids"]:
+            return False, None
+
+        # 1. HORA Y FECHA
+        if any(p in norm for p in ["que hora es", "la hora", "dime la hora", "decime la hora"]):
+            now = datetime.datetime.now()
+            h = now.hour
+            m = now.minute
+            periodo = "de la mañana" if h < 13 else ("de la tarde" if h < 20 else "de la noche")
+            h_12 = h if h <= 12 else (h - 12)
+            if h_12 == 0: h_12 = 12
+            min_str = "en punto" if m == 0 else f"y {m}"
+            msg = f"Son las {h_12} {min_str} {periodo}, che."
+            state_mgr.emit_tool_call("get_local_time", {}, msg)
+            return True, msg
+
+        if any(p in norm for p in ["que dia es", "que fecha es", "en que dia estamos", "en que fecha estamos"]):
+            dias = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
+            meses = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
+            now = datetime.datetime.now()
+            dia_semana = dias[now.weekday()]
+            dia_num = now.day
+            mes = meses[now.month - 1]
+            msg = f"Hoy es {dia_semana} {dia_num} de {mes}, che."
+            state_mgr.emit_tool_call("get_local_date", {}, msg)
+            return True, msg
+
+
+        # 2. CLIMA Y PRONÓSTICO
+        if any(p in norm for p in ["clima", "pronostico", "tiempo hoy", "va a llover", "estado del tiempo", "temperatura"]):
+            ciudad = "Buenos Aires"
+            for c in ["cordoba", "rosario", "mendoza", "la plata", "salta", "mar del plata", "tucuman"]:
+                if c in norm:
+                    ciudad = c.capitalize()
+                    break
+            res = system_control.get_weather(ciudad)
+            msg = res.get("message", "No pude conseguir el pronóstico ahora.")
+            return True, msg
+
+        # 3. RECURSOS DE LA PC (HARDWARE)
+        if any(p in norm for p in ["como viene la compu", "como va la compu", "recursos", "telemetria", "hardware", "temperatura de la compu", "cpu", "memoria ram", "disco"]):
+            metrics = system_control.get_system_metrics()
+            system_control.switch_screen_view("telemetry")
+            cpu = metrics.get("cpu_percent", 0)
+            ram = metrics.get("ram_percent", 0)
+            msg = f"La compu viene diez puntos: la CPU está al {cpu}% y la memoria RAM al {ram}%. Ahí te puse la telemetría en pantalla."
+            return True, msg
+
+        # 4. CAMBIO DE PANTALLAS DEL HUD
+        if any(p in norm for p in ["mostrame tu cara", "pone tu cara", "modo cara", "avatar", "rostro"]):
+            res = system_control.switch_screen_view("face")
+            return True, res.get("message", "Ahí te pongo la cara en pantalla, papá.")
+
+        if any(p in norm for p in ["panel de control", "mostrame el orbe", "menu", "pantalla principal", "volver al control"]):
+            res = system_control.switch_screen_view("orb")
+            return True, res.get("message", "Listo che, volvemos al control.")
+
+        if any(p in norm for p in ["pantalla de recursos", "mostrar recursos", "ver recursos"]):
+            res = system_control.switch_screen_view("telemetry")
+            return True, res.get("message", "Ahí te pongo la pantalla de recursos.")
+
+        # 5. CONTROL DE CÁMARA
+        if any(p in norm for p in ["cambia de camara", "cambiar camara", "camara trasera", "camara delantera", "dar vuelta la camara"]):
+            mode = "user" if any(x in norm for x in ["delantera", "frontal", "adelante"]) else ("environment" if any(x in norm for x in ["trasera", "atras"]) else "toggle")
+            res = system_control.flip_camera(mode)
+            return True, res.get("message", "Cámara cambiada, che.")
+
+        # 6. MINIMIZAR Y VOLUMEN
+        if any(p in norm for p in ["minimiza todo", "minimizame todo", "mostrame el escritorio", "ir al escritorio"]):
+            res = system_control.minimize_all()
+            return True, res.get("message", "Escritorio a la vista, papá.")
+
+        if any(p in norm for p in ["subi el volumen", "sube el volumen", "mas volumen"]):
+            res = system_control.volume_up(15)
+            return True, res.get("message", "Volumen arriba, papá.")
+
+        if any(p in norm for p in ["baja el volumen", "baja el volumen", "menos volumen"]):
+            res = system_control.volume_down(15)
+            return True, res.get("message", "Volumen bajado, che.")
+
+        if any(p in norm for p in ["silencio", "mute", "mutea", "silencia"]):
+            res = system_control.mute()
+            return True, res.get("message", "Audio muteado.")
+
+        # 6b. CONTROL MULTIMEDIA (PLAY, PAUSA, PARAR, SIGUIENTE, ANTERIOR)
+        # Acciones para DETENER / CERRAR completamente YouTube/Brave:
+        if any(p in norm for p in [
+            "para la musica", "pará la musica", "corta la musica", "cortá la musica",
+            "para el video", "pará el video", "corta el video", "cortá el video",
+            "detener video", "detener el video", "detene el video", "detené el video",
+            "apaga la musica", "apagá la musica", "cerra youtube", "cerrá youtube", "cerrar youtube",
+            "cerra brave", "cerrá brave", "cerrar brave", "cerrar musica", "cerra musica", "cerrá la musica",
+            "detener la musica", "detene la musica", "detené la musica"
+        ]):
+            res = system_control.stop_music()
+            return True, res.get("message", "Listo, cerré Brave y la música.")
+
+        # Acciones para PAUSAR / REANUDAR (afectan a Brave sin despausar Chrome):
+        if any(p in norm for p in [
+            "pone pausa", "poné pausa", "pausa", "pausar", "pausalo", "pausala", "ponele pausa", "ponéle pausa",
+            "dale play", "play", "reanudar", "continua", "continuar", "despausa", "despausar", "pone play", "poné play",
+            "frena la musica", "frená la musica", "frena", "frená", "frenalo", "frenálo", "paralo", "parálo", "detener", "detene", "detené", "stop"
+        ]):
+            res = system_control.media_play_pause()
+            return True, res.get("message", "Play/Pausa enviado, che.")
+
+        if any(p in norm for p in ["siguiente tema", "siguiente cancion", "pasa de tema", "pasa la cancion", "otro tema", "siguiente pista", "siguiente", "cambia de tema", "cambiá de tema"]):
+            res = system_control.media_next()
+            return True, "Puse el tema siguiente, crack."
+
+        if any(p in norm for p in ["tema anterior", "cancion anterior", "anterior tema", "volver al tema anterior", "anterior pista", "cancion previa", "tema previo"]):
+            res = system_control.media_prev()
+            return True, "Volví al tema anterior."
+
+        if any(p in norm for p in ["que cancion es", "que cancion está sonando", "que tema es", "que tema esta sonando", "que esta sonando", "que musica esta sonando", "como se llama este tema", "como se llama esta cancion"]):
+            res = system_control.get_current_song()
+            return True, res.get("message", "No pude identificar qué tema está sonando ahora, che.")
+
+        # Configuración de reproductor predeterminado
+        if any(p in norm for p in ["usa spotify por defecto", "usá spotify por defecto", "spotify por defecto", "spotify como predeterminado", "pone la musica en spotify", "poné la musica en spotify"]):
+            config.set_default_music_player("spotify")
+            return True, "Listo, fiera: de ahora en más reproduzco toda la música en Spotify."
+
+        if any(p in norm for p in ["usa youtube por defecto", "usá youtube por defecto", "youtube por defecto", "youtube como predeterminado", "pone la musica en youtube", "poné la musica en youtube"]):
+            config.set_default_music_player("youtube")
+            return True, "Listo, fiera: de ahora en más reproduzco toda la música en YouTube."
+
+        # 7. REPRODUCCIÓN O APERTURA DE YOUTUBE (Brave / YouTube App)
+        is_yt = "youtube" in norm
+        is_sp = "spotify" in norm
+        is_music_request = (
+            any(norm.startswith(p) for p in [
+                "pone el tema", "poné el tema", "pon el tema",
+                "pone la cancion", "poné la cancion", "pon la cancion",
+                "pone la cumbia", "poné la cumbia", "pon la cumbia",
+                "pone musica", "poné musica", "pon musica",
+                "pone un tema", "poné un tema", "pon un tema",
+                "reproduci el tema", "reproducí el tema", "reproduci la cancion", "reproducí la cancion",
+                "escuchar el tema", "escucha el tema", "escuchar la cancion", "escucha la cancion"
+            ])
+            or any(k in norm for k in ["cumbia de los trapos", "entre el cielo vos y yo"])
+            or ((norm.startswith("pone ") or norm.startswith("poné ") or norm.startswith("pon ") or norm.startswith("reproduci ") or norm.startswith("reproducí "))
+                and any(g in norm for g in ["cumbia", "cancion", "tema", "musica", "rock", "trap", "rap", "cuarteto", "reggaeton"]))
+        )
+
+        if is_yt or (is_music_request and config.default_music_player != "spotify" and not is_sp):
+            yt_lnk = r"C:\Users\Exevaz27\Desktop\YouTube.lnk"
+            import os
+            # Si solo pide abrir YouTube sin especificar tema o canción
+            if any(w in norm for w in ["abri youtube", "abrir youtube", "pone youtube", "iniciar youtube"]) and not any(k in norm for k in ["pone en youtube", "reproduci", "tema", "cancion", "video", "musica"]):
+                if os.path.exists(yt_lnk):
+                    os.startfile(yt_lnk)
+                    return True, "Ahí te abrí la app de YouTube, fiera."
+
+            yt_query = norm
+            for phrase in [
+                "pone en youtube", "poné en youtube", "pon en youtube", "poneme en youtube", "poner en youtube",
+                "reproducir en youtube", "reproduci en youtube", "reproducí en youtube", "reproducime en youtube",
+                "buscar en youtube", "busca en youtube", "buscá en youtube", "buscame en youtube", "en youtube",
+                "de youtube", "por youtube", "youtube"
+            ]:
+                yt_query = yt_query.replace(phrase, "")
+            yt_query = yt_query.strip()
+            for p in ["el titan", "titan", "che titan", "che", "abri youtube", "abrir youtube", "eu titan", "ey titan", "oye titan"]:
+                if yt_query.startswith(p):
+                    yt_query = yt_query[len(p):].strip()
+            for start_word in [
+                "pone", "poné", "pon", "poner", "poneme", "ponéme",
+                "reproducir", "reproduci", "reproducí", "reproducime",
+                "buscar", "busca", "buscá", "buscame",
+                "escuchar", "escucha", "toca", "tocá",
+                "el tema de", "el tema del", "el tema", "la cancion de", "la cancion del", "la cancion",
+                "la musica de", "la musica del", "la musica", "musica", "del", "de", "el", "la", "a"
+            ]:
+                if yt_query.startswith(start_word + " "):
+                    yt_query = yt_query[len(start_word):].strip()
+
+            if yt_query:
+                res = system_control.play_youtube(yt_query)
+                return True, res.get("message", f"Ahí te puse {yt_query} en YouTube con Brave.")
+            elif os.path.exists(yt_lnk):
+                os.startfile(yt_lnk)
+                return True, "Ahí te abrí la app de YouTube, fiera."
+
+        elif is_music_request and config.default_music_player == "spotify" and not is_yt:
+            music_query = norm
+            for p in ["el titan", "titan", "che titan", "che", "eu titan", "ey titan", "oye titan"]:
+                if music_query.startswith(p):
+                    music_query = music_query[len(p):].strip()
+            for start_word in [
+                "pone", "poné", "pon", "poner", "poneme", "ponéme",
+                "reproducir", "reproduci", "reproducí", "reproducime",
+                "buscar", "busca", "buscá", "buscame",
+                "escuchar", "escucha", "toca", "tocá",
+                "el tema de", "el tema del", "el tema", "la cancion de", "la cancion del", "la cancion",
+                "la musica de", "la musica del", "la musica", "musica", "del", "de", "el", "la", "a"
+            ]:
+                if music_query.startswith(start_word + " "):
+                    music_query = music_query[len(start_word):].strip()
+            res = system_control.play_spotify(music_query)
+            return True, res.get("message", f"Ahí te puse {music_query} en Spotify.")
+
+        # 8. REPRODUCCIÓN / BÚSQUEDA EN SPOTIFY
+        if "spotify" in norm:
+            sp_query = norm
+            for phrase in [
+                "pone en spotify", "poné en spotify", "pon en spotify", "poneme en spotify", "ponéme en spotify",
+                "reproducir en spotify", "reproduci en spotify", "reproducí en spotify", "reproducime en spotify",
+                "buscar en spotify", "busca en spotify", "buscá en spotify", "buscame en spotify",
+                "abrir spotify y poner", "abrí spotify y poné", "abri spotify y pone", "abrir spotify", "abrí spotify", "abri spotify",
+                "escuchar en spotify", "escucha en spotify", "en spotify", "de spotify", "por spotify", "spotify"
+            ]:
+                sp_query = sp_query.replace(phrase, " ")
+            sp_query = " ".join(sp_query.split()).strip()
+
+            for p in ["el titan", "titan", "che titan", "che", "eu titan", "ey titan", "oye titan"]:
+                if sp_query.startswith(p):
+                    sp_query = sp_query[len(p):].strip()
+
+            changed = True
+            while changed:
+                changed = False
+                for start_word in [
+                    "pone", "poné", "pon", "poner", "poneme", "ponéme",
+                    "reproducir", "reproduci", "reproducí", "reproducime",
+                    "toca", "tocá", "tocame", "tocáme",
+                    "escuchar", "escucha", "buscar", "busca", "buscá",
+                    "una cancion de", "una cancion del", "una canción de", "una canción del",
+                    "un tema de", "un tema del", "un tema", "una cancion", "una canción",
+                    "el tema de", "el tema del", "el tema",
+                    "la cancion de", "la cancion del", "la cancion",
+                    "la canción de", "la canción del", "la canción",
+                    "la musica de", "la musica del", "la musica", "musica", "del", "de", "el", "la", "a"
+                ]:
+                    if sp_query.startswith(start_word + " "):
+                        sp_query = sp_query[len(start_word):].strip()
+                        changed = True
+                        break
+
+            res = system_control.play_spotify(sp_query)
+            return True, res.get("message", f"Ahí te puse {sp_query} en Spotify.")
+
+        # 9. LANZAMIENTO DIRECTO DE PROGRAMAS COMUNES
+        m_app = re.search(r'(?:abri|abrir|ejecuta|lanzar)\s+(?:el|la|los|las)?\s*(calculadora|bloc de notas|notepad|chrome|navegador|spotify|word|excel|inkscape)', norm)
+        if m_app:
+            app_raw = m_app.group(1).strip()
+            app_name = "calculadora" if "calc" in app_raw else ("bloc de notas" if ("bloc" in app_raw or "notepad" in app_raw) else app_raw)
+            res = app_launcher.launch(app_name)
+            return True, res.get("message", f"Ahí te abrí {app_name}, che.")
+
+        # 10. CONTROL DE VENTANAS DE WINDOWS
+        if any(p in norm for p in [
+            "cerra la ventana", "cerrá la ventana", "cerrar ventana", "cerrar la ventana",
+            "cerra esto", "cerrá esto", "cerra el programa", "cerrá el programa", "cerrar programa"
+        ]):
+            res = system_control.close_active_window()
+            return True, res.get("message", "Listo, cerré la ventana activa.")
+
+        if any(p in norm for p in [
+            "maximiza la ventana", "maximizá la ventana", "maximizar la ventana", "maximizar ventana",
+            "maximiza esto", "maximizá esto", "pantalla completa de la ventana"
+        ]):
+            res = system_control.maximize_active_window()
+            return True, res.get("message", "Ventana maximizada, papá.")
+
+        if any(p in norm for p in [
+            "minimiza la ventana", "minimizá la ventana", "minimizar la ventana", "minimizar ventana",
+            "minimiza esta ventana", "minimizá esta ventana"
+        ]):
+            res = system_control.minimize_active_window()
+            return True, res.get("message", "Ventana minimizada, che.")
+
+        if any(p in norm for p in [
+            "cambia de ventana", "cambiá de ventana", "cambiar de ventana", "cambiar ventana",
+            "pasa a la otra ventana", "pasá a la otra ventana", "siguiente ventana", "otra ventana"
+        ]):
+            res = system_control.switch_active_window()
+            return True, res.get("message", "Ahí pasé a la otra ventana.")
+
+        # 11. PAPELERA DE RECICLAJE
+        if any(p in norm for p in [
+            "vacia la papelera", "vaciá la papelera", "vaciar la papelera", "vaciar papelera",
+            "limpia la papelera", "limpiá la papelera", "limpiar la papelera"
+        ]):
+            res = system_control.empty_recycle_bin()
+            return True, res.get("message", "¡Listo, papá! Vacié la papelera de reciclaje.")
+
+        # 12. BÚSQUEDA DIRECTA EN GOOGLE
+        if (norm.startswith("buscame en google ") or norm.startswith("buscá en google ") or
+            norm.startswith("busca en google ") or norm.startswith("buscar en google ") or
+            norm.startswith("googlea ") or norm.startswith("guglea ")):
+            g_query = norm
+            for p in ["buscame en google", "buscá en google", "busca en google", "buscar en google", "googlea", "guglea"]:
+                if g_query.startswith(p):
+                    g_query = g_query[len(p):].strip()
+                    break
+            for prefix in ["el titan", "titan", "che titan", "che"]:
+                if g_query.startswith(prefix + " "):
+                    g_query = g_query[len(prefix):].strip()
+            if g_query:
+                res = system_control.search_google(g_query)
+                return True, res.get("message", f"Buscando '{g_query}' en Google.")
+
+        # 13. ACCESOS DIRECTOS WEB
+        if any(p in norm for p in ["abri whatsapp", "abrir whatsapp", "whatsapp web", "pone whatsapp", "abrir wpp"]):
+            res = system_control.open_web_service("whatsapp")
+            return True, res.get("message", "Ahí te abrí WhatsApp Web, che.")
+
+        if any(p in norm for p in ["abri mercado libre", "abrir mercado libre", "mercadolibre", "mercado libre"]):
+            res = system_control.open_web_service("mercadolibre")
+            return True, res.get("message", "Ahí te abrí Mercado Libre, papá.")
+
+        if any(p in norm for p in ["abri gmail", "abrir gmail", "abrir correo", "abri el correo", "el correo"]):
+            res = system_control.open_web_service("gmail")
+            return True, res.get("message", "Ahí te abrí Gmail, che.")
+
+        # 14. ENERGÍA (APAGAR O REINICIAR CON CONFIRMACIÓN)
+        if any(p in norm for p in ["apaga la compu", "apagar la compu", "apaga la pc", "apagar la pc", "apagar el sistema"]):
+            self.pending_confirmation = "shutdown"
+            return True, "Pará che, ¿seguro que querés apagar la compu? Decime 'sí' para confirmar o 'no' para cancelar."
+
+        if any(p in norm for p in ["reinicia la compu", "reiniciar la compu", "reinicia la pc", "reiniciar la pc"]):
+            self.pending_confirmation = "restart"
+            return True, "Che, ¿seguro que querés reiniciar la máquina? Decime 'sí' para confirmar o 'no' para cancelar."
+
+        # 15. PREGUNTAS SOBRE TITÁN (CONVERSACIONAL LOCAL - SIN CHISTES)
+        if any(p in norm for p in ["quien sos", "como te llamas", "cual es tu nombre", "quien te creo"]):
+            return True, "¡Soy Titán, tu asistente personal y compinche en Windows! Con la garra y el optimismo de Martín Palermo. Acá estoy firme para lo que necesites, papá."
+
+        if any(p in norm for p in ["como andas", "como estas", "todo bien", "como te va", "que onda"]):
+            return True, "¡De diez, che! Tomando unos mates virtuales y listos para salir a ganar en la compu. ¿Vos cómo venís, fiera?"
+
+        if any(p in norm for p in ["que sabes hacer", "que podes hacer", "cuales son tus funciones", "que cosas haces"]):
+            return True, "De todo, fiera: te abro apps, te pongo temas en YouTube o Spotify, te manejo el volumen y las ventanas, te busco archivos, te saco capturas y hasta te miro cosas con la cámara del celular. Decime y lo hacemos al toque."
+
+        if any(p in norm for p in ["de que cuadro sos", "de que equipo sos", "hincha de que sos", "de quien sos hincha"]):
+            return True, "¡De Boca Juniors, papá! Como el gran Martín Palermo, con el corazón bien azul y oro."
+
+        # 16. CÁMARA SAMSUNG J2 Y VIGILANCIA REMOTA
+        if any(p in norm for p in [
+            "cambiar camara j2", "cambia la camara del j2", "cambiar camara del j2", "cambia la camara",
+            "cambiar la camara", "girar la camara", "da vuelta la camara", "dar vuelta la camara",
+            "invertir camara", "invertir la camara", "alternar camara", "cambia de camara"
+        ]):
+            from brain.tool_registry import toggle_j2_camera
+            res = toggle_j2_camera()
+            return True, f"¡Listo! {res}"
+
+        if any(p in norm for p in [
+            "foto con el j2", "foto con j2", "sacame una foto con el j2", "sacar foto con el j2",
+            "saca una foto con el j2", "foto de la pieza", "sacame una foto de la pieza"
+        ]):
+            from brain.tool_registry import capture_j2_photo
+            res = capture_j2_photo()
+            return True, res
+
+        if any(p in norm for p in [
+            "vigilar pieza", "vigila la pieza", "vigilar la habitacion", "vigila la habitacion",
+            "revisa la pieza", "revisar la pieza", "que pasa en la pieza", "que pasa en mi pieza"
+        ]):
+            from brain.tool_registry import vigilance_check_j2
+            res = vigilance_check_j2()
+            return True, res
+
+        # 17. CONTROL DE BRILLO Y LUZ NOCTURNA
+        if any(p in norm for p in ["subi el brillo", "subir el brillo", "mas brillo", "subime el brillo", "aumenta el brillo", "aumentar el brillo", "subile al brillo"]):
+            res = system_control.brightness_up(15)
+            return True, res.get("message", "Subí el brillo de la pantalla.")
+
+        if any(p in norm for p in ["baja el brillo", "bajar el brillo", "menos brillo", "bajame el brillo", "disminui el brillo", "disminuir el brillo", "bajale al brillo"]):
+            res = system_control.brightness_down(15)
+            return True, res.get("message", "Bajé el brillo de la pantalla.")
+
+        match_brillo = re.search(r"brillo\s+(?:al|en)?\s*(\d{1,3})%?", norm)
+        if match_brillo:
+            level = int(match_brillo.group(1))
+            res = system_control.set_brightness(level)
+            return True, res.get("message", f"Puse el brillo al {level}%.")
+
+        if any(p in norm for p in ["cuanto brillo tengo", "que brillo tengo", "nivel de brillo", "decime el brillo", "ver brillo"]):
+            res = system_control.get_brightness()
+            return True, res.get("message", "Consulté el brillo del monitor.")
+
+        if any(p in norm for p in ["luz nocturna", "modo noche de pantalla", "activa la luz nocturna", "descansar la vista", "luz de noche"]):
+            res = system_control.toggle_night_light()
+            return True, res.get("message", "Te abrí la configuración de Luz Nocturna.")
+
+        # 18. DOCTOR DE PC Y PROCESOS
+        if any(p in norm for p in ["modo gamer", "optimizar pc", "optimiza la pc", "optimizame la pc", "cerrar programas de fondo", "liberar ram", "libera ram", "libera memoria", "liberar memoria"]):
+            res = system_control.optimize_pc_gaming()
+            return True, res.get("message", "¡Modo Gamer aplicado! Liberé recursos cerrando programas no esenciales.")
+
+        if any(p in norm for p in [
+            "que procesos consumen mas ram", "quien consume mas ram", "top procesos", "quien gasta mas memoria",
+            "que programas estan consumiendo", "procesos que mas gastan", "que consume tanta ram"
+        ]):
+            from brain.tool_registry import get_top_processes
+            return True, get_top_processes(sort_by="ram", limit=5)
+
+        match_kill = re.search(r"(?:mata a|matar a|cerra el proceso|cerrar el proceso|mata el proceso|matar proceso)\s+([a-zA-Z0-9_\-\.]+)", norm)
+        if match_kill:
+            proc_target = match_kill.group(1).strip()
+            if proc_target:
+                res = system_control.kill_process(proc_target)
+                return True, res.get("message", f"Intenté cerrar el proceso '{proc_target}'.")
+
+        # 19. DIAGNÓSTICO DE RED Y CONECTIVIDAD
+        if any(p in norm for p in ["limpia el dns", "limpiar dns", "flush dns", "purga el dns", "borra la cache de dns", "limpia la cache de dns"]):
+            res = system_control.flush_dns()
+            return True, res.get("message", "Caché DNS purgada con éxito.")
+
+        if any(p in norm for p in ["hace un ping", "hacer ping", "probar conexion", "proba la conexion", "test de red", "test de ping", "como esta el internet"]):
+            res = system_control.test_network_ping()
+            return True, res.get("message", "Prueba de ping realizada.")
+
+        if any(p in norm for p in ["cual es mi ip", "mi direccion ip", "info de red", "informacion de red", "como se llama mi compu en red"]):
+            res = system_control.get_network_info()
+            return True, res.get("message", "Información de red obtenida.")
+
+        # 20. ORGANIZADOR AUTOMÁTICO DE ARCHIVOS
+        if any(p in norm for p in ["ordena descargas", "ordenar descargas", "ordename descargas", "limpia descargas", "organizar descargas", "ordena la carpeta descargas"]):
+            from brain.tool_registry import organize_folder
+            return True, organize_folder("Downloads")
+
+        if any(p in norm for p in ["ordena el escritorio", "ordenar el escritorio", "ordename el escritorio", "limpia el escritorio", "organizar escritorio"]):
+            from brain.tool_registry import organize_folder
+            return True, organize_folder("Desktop")
+
+        # 21. POTENCIADOR DEL PORTAPAPELES CON IA
+        if any(p in norm for p in ["traduci el portapapeles", "traducir portapapeles", "traduci lo que copie", "traducir lo que tengo copiado", "traducime el portapapeles"]):
+            from brain.tool_registry import translate_clipboard
+            return True, translate_clipboard()
+
+        if any(p in norm for p in ["mejora el portapapeles", "corregi el portapapeles", "reescribi el portapapeles", "arregla el portapapeles", "mejorame el texto copiado"]):
+            from brain.tool_registry import rewrite_clipboard
+            return True, rewrite_clipboard()
+
+        if any(p in norm for p in ["extrae el texto de la pantalla", "copia el texto de la pantalla", "ocr de la pantalla", "lee el texto de la pantalla", "sacale el texto a la pantalla"]):
+            from brain.tool_registry import extract_text_from_screen
+            return True, extract_text_from_screen()
+
+        return False, None
+
+
+local_intents = LocalIntentEngine()

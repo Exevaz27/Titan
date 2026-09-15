@@ -1,0 +1,617 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Titán // HUD & Avatar</title>
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="theme-color" content="#000000">
+  <link rel="manifest" href="/static/manifest.json">
+  <link rel="stylesheet" href="/static/style.css?v=50">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;600;800&family=Outfit:wght@300;400;600;700&display=swap" rel="stylesheet">
+</head>
+<body class="state-idle active-view-face">
+
+  <!-- Selector de Vistas Superior (Conmutable por voz o toque) -->
+  <nav class="view-nav" id="viewNav">
+    <button class="nav-tab active" data-view="face" id="tabFace">
+      <span class="tab-icon">👤</span>
+      <span class="tab-label">CARA</span>
+    </button>
+    <button class="nav-tab" data-view="orb" id="tabOrb">
+      <span class="tab-icon">🔮</span>
+      <span class="tab-label">CONTROL</span>
+    </button>
+    <button class="nav-tab" data-view="telemetry" id="tabTelemetry">
+      <span class="tab-icon">⚡</span>
+      <span class="tab-label">RECURSOS</span>
+    </button>
+    <button class="nav-tab" id="btnFullscreen" title="Pantalla Completa" style="padding: 0.4rem 0.6rem;">
+      <span>⛶</span>
+    </button>
+    <button class="nav-tab" id="btnMuteAudio" title="Voz silenciada en esta pantalla (sale por Servidor Titán DDR3). Clic para escucharla acá." style="padding: 0.4rem 0.6rem; color: var(--neon-red); border-color: rgba(255, 51, 102, 0.5);">
+      <span id="muteAudioIcon">🔇</span>
+    </button>
+    <button class="nav-tab nav-btn-handsfree" id="navBtnHandsFree" title="Activar escucha permanente de voz" style="color: var(--neon-green); border-color: rgba(0, 255, 136, 0.4); margin-left: 0.3rem;">
+      <span id="navHandsFreeIcon">👂</span>
+      <span id="navHandsFreeLabel">MANOS LIBRES</span>
+    </button>
+    <div class="nav-status-pill" id="connStatus">
+      <span class="dot"></span>
+      <span class="status-txt" id="connText">ON</span>
+    </div>
+  </nav>
+
+  <!-- Barra Superior de Modos de Personalidad (Compinche / Pibes / Rebelde) -->
+  <div class="mode-bar-container" id="modeBar">
+    <div class="mode-selector-group">
+      <button class="mode-pill active" id="btnModeNormal" data-mode="normal" title="Modo Normal: Compinche de fierro (La Boca)">
+        <span class="mode-indicator dot-normal"></span>
+        <span class="mode-label">🟢 COMPINCHE</span>
+      </button>
+      <button class="mode-pill" id="btnModeKids" data-mode="kids" title="Modo Pibes: Hermano mayor caprichoso (ATP - Cero malas palabras)">
+        <span class="mode-indicator dot-kids"></span>
+        <span class="mode-label">🟡 PIBES (ATP)</span>
+      </button>
+      <button class="mode-pill" id="btnModeRebel" data-mode="rebel" title="Modo Rebelde: Sin filtro / Adultos (Puteador)">
+        <span class="mode-indicator dot-rebel"></span>
+        <span class="mode-label">🔴 REBELDE</span>
+      </button>
+      <button class="mode-pill" id="btnModeTertulia" data-mode="tertulia" title="Modo Termo: Folclore futbolero, debate picante y pasión bostera">
+        <span class="mode-indicator dot-tertulia"></span>
+        <span class="mode-label">⚽ MODO TERMO</span>
+      </button>
+    </div>
+    <div class="speaker-pill" id="speakerBadge" title="Interlocutor acústico detectado por tono">
+      <span class="speaker-icon" id="speakerIcon">🎙️</span>
+      <span class="speaker-name" id="speakerName">Voz: Auto</span>
+    </div>
+  </div>
+
+  <!-- ============================================================ -->
+  <!-- VISTA 1: CARA / AVATAR A PANTALLA COMPLETA                   -->
+  <!-- ============================================================ -->
+  <section class="view-container" id="viewFace">
+    <div class="face-canvas-wrapper" id="faceTriggerArea" title="Tocá la cara para hablar">
+      
+      <!-- Definiciones de recorte SVG para párpados curvos de modorra -->
+      <svg width="0" height="0" style="position: absolute;">
+        <defs>
+          <clipPath id="curvedEyelidCut" clipPathUnits="objectBoundingBox">
+            <path d="M 0,0.32 Q 0.5,0.44 1,0.32 L 1,1.05 L 0,1.05 Z" />
+          </clipPath>
+          <clipPath id="deepCurvedCut" clipPathUnits="objectBoundingBox">
+            <path d="M 0,0.70 Q 0.5,0.82 1,0.70 L 1,1.05 L 0,1.05 Z" />
+          </clipPath>
+        </defs>
+      </svg>
+
+      <!-- Rostro Base de Titán -->
+      <div id="cara">
+        <!-- Capa de Zzz para modo siesta (Etapa 3) -->
+        <div class="zzz-layer" id="zzzLayer">
+          <span class="zzz-particle zzz-1">z</span>
+          <span class="zzz-particle zzz-2">z</span>
+          <span class="zzz-particle zzz-3">Z</span>
+        </div>
+
+        <div class="anger-mark" id="angerMark">💢</div>
+        <div class="steam steam-left" id="steamLeft">💨</div>
+        <div class="steam steam-right" id="steamRight">💨</div>
+        <div class="ceja izq" id="eyebrowLeft"></div>
+        <div class="ceja der" id="eyebrowRight"></div>
+        <div class="ojo izq" id="eyeLeft">
+          <div class="eye-closed-curve"></div>
+          <svg class="eyelid-arc-svg" viewBox="0 0 46 58">
+            <path d="M 0,18.5 Q 23,25.5 46,18.5" fill="none" stroke="var(--state-color, var(--color-anillo))" stroke-width="4.5" />
+          </svg>
+        </div>
+        <div class="ojo der" id="eyeRight">
+          <div class="eye-closed-curve"></div>
+          <svg class="eyelid-arc-svg" viewBox="0 0 46 58">
+            <path d="M 0,18.5 Q 23,25.5 46,18.5" fill="none" stroke="var(--state-color, var(--color-anillo))" stroke-width="4.5" />
+          </svg>
+        </div>
+        <div class="boca" id="mouthMesh"></div>
+
+        <!-- Capa de Mate y Pava Matera (Etapa 1: Recreo) -->
+        <div class="mate-scene-layer" id="mateSceneLayer">
+          <span class="steam-vapor mate-steam-1">~</span>
+          <span class="steam-vapor mate-steam-2">~</span>
+
+          <svg class="mate-svg-layer" viewBox="0 0 200 280">
+            <!-- Chorro de agua directo al centro de la yerba (114, 236) -->
+            <g id="waterStreamGroup">
+              <line x1="96" y1="218" x2="114" y2="236" stroke="rgba(0, 212, 255, 0.5)" stroke-width="5" stroke-linecap="round" />
+              <line x1="96" y1="218" x2="114" y2="236" stroke="#ffffff" stroke-width="2.8" stroke-linecap="round" />
+              <line x1="96" y1="218" x2="114" y2="236" stroke="#00d4ff" stroke-width="1.2" stroke-dasharray="3,2" />
+              <circle cx="114" cy="236" r="2.5" fill="#00ffaa" opacity="0.9" />
+              <circle cx="112" cy="235" r="1.5" fill="#ffffff" opacity="0.95" />
+            </g>
+
+            <!-- Pava Matera desde la izquierda pivotando sobre su pico -->
+            <g id="kettleLeftGroup">
+              <path d="M 62,192 C 72,204 68,218 54,222 C 38,226 22,220 16,208 C 12,198 22,190 32,188 Z" fill="#00081a" stroke="var(--state-color, #00d4ff)" stroke-width="2.5" />
+              <ellipse cx="42" cy="186" rx="10" ry="3.5" fill="#00142e" stroke="#ffffff" stroke-width="1.8" />
+              <circle cx="42" cy="182" r="2.5" fill="#ffffff" />
+              <path d="M 58,202 Q 82,204 96,218 Q 86,220 70,212" fill="#00081a" stroke="var(--state-color, #00d4ff)" stroke-width="2.2" stroke-linecap="round" />
+              <ellipse cx="96" cy="218" rx="2" ry="1.2" fill="#ffffff" />
+              <path d="M 52,186 C 56,168 26,168 30,186" fill="none" stroke="#ffffff" stroke-width="3" stroke-linecap="round" />
+              <path d="M 52,186 C 56,168 26,168 30,186" fill="none" stroke="var(--state-color, #00d4ff)" stroke-width="1.2" stroke-linecap="round" />
+            </g>
+
+            <!-- Mate y Bombilla criolla (Ángulo natural ~14°, casi vertical saliendo hacia la boca) -->
+            <g id="mateRigidPiece">
+              <!-- Sombra base -->
+              <ellipse cx="116" cy="268" rx="18" ry="4" fill="rgba(0, 212, 255, 0.2)" />
+
+              <!-- Tubo de la Bombilla (112, 246) -> (100, 198) -->
+              <line x1="112" y1="246" x2="100" y2="198" stroke="rgba(0, 212, 255, 0.45)" stroke-width="8" stroke-linecap="round" />
+              <line x1="112" y1="246" x2="100" y2="198" stroke="#ffffff" stroke-width="4.5" stroke-linecap="round" />
+              <line x1="112" y1="246" x2="100" y2="198" stroke="var(--state-color, #00d4ff)" stroke-width="2" stroke-linecap="round" />
+
+              <!-- Anillos refrigerantes a -14° -->
+              <g transform="translate(106, 222) rotate(-14)">
+                <rect x="-3" y="-4" width="6" height="2" rx="1" fill="#ffffff" stroke="var(--state-color, #00d4ff)" stroke-width="0.8" />
+                <rect x="-3" y="-1" width="6" height="2" rx="1" fill="#ffffff" stroke="var(--state-color, #00d4ff)" stroke-width="0.8" />
+                <rect x="-3" y="2" width="6" height="2" rx="1" fill="#ffffff" stroke="var(--state-color, #00d4ff)" stroke-width="0.8" />
+              </g>
+
+              <!-- Pico de la bombilla apoyado en la boca a -14° -->
+              <g transform="translate(100, 198) rotate(-14)">
+                <path d="M -3,-1 L 3,-1 L 2.5,5 L -2.5,5 Z" fill="#ffffff" stroke="var(--state-color, #00d4ff)" stroke-width="1.2" filter="drop-shadow(0 0 3px #00d4ff)" />
+                <ellipse cx="0" cy="-1" rx="2.8" ry="1.1" fill="#00081a" stroke="#ffffff" stroke-width="0.8" />
+              </g>
+
+              <!-- Calabaza criolla -->
+              <path d="M 100,236 C 88,242 88,258 98,264 C 106,270 126,270 134,264 C 144,258 144,242 132,236 Z" fill="#00081a" stroke="var(--state-color, #00d4ff)" stroke-width="3" filter="drop-shadow(0 0 6px rgba(0, 212, 255, 0.8))" />
+              <path d="M 116,240 Q 118,254 116,267" stroke="rgba(0, 212, 255, 0.45)" stroke-dasharray="2,3" stroke-width="1.8" />
+
+              <!-- Virola superior y boca de yerba -->
+              <ellipse cx="116" cy="236" rx="17" ry="5.5" fill="#00142e" stroke="#ffffff" stroke-width="2" />
+              <ellipse cx="116" cy="236" rx="13" ry="4" fill="#00081a" stroke="rgba(0, 212, 255, 0.6)" stroke-width="1" />
+
+              <!-- Montañita de yerba y espuma -->
+              <path d="M 110,235 Q 120,233 128,236" stroke="#00ffaa" stroke-width="2" fill="none" opacity="0.9" />
+              <circle cx="112" cy="236" r="1.5" fill="#00ffaa" opacity="0.8" />
+              <circle cx="115" cy="235" r="1.2" fill="#ffffff" opacity="0.9" />
+            </g>
+          </svg>
+        </div>
+      </div>
+
+      <!-- Medidor de paciencia y desgano en modo rebelde -->
+      <div class="rebel-meter-container" id="rebelMeterContainer">
+        <div class="rebel-meter-header">
+          <span class="rebel-meter-title">PACIENCIA: <strong id="patienceVal">100%</strong></span>
+          <span class="rebel-meter-sub">GANAS: <strong id="workWillVal">-100%</strong></span>
+        </div>
+        <div class="rebel-meter-track">
+          <div class="rebel-meter-bar" id="patienceBar"></div>
+        </div>
+      </div>
+
+      <!-- Subtítulo flotante de lo que está diciendo -->
+      <div class="face-speech-bubble" id="faceSpeechBubble">
+        <span class="face-speech-text" id="faceSpeechText">¡Hola che! Soy Titán. Tocame o decí "Titán" para hablarme.</span>
+      </div>
+
+      <!-- Botones Flotantes Discretos de Control (Accesibles siempre, incluso en Pantalla Completa) -->
+      <div class="floating-controls" id="floatingControls">
+        <button class="btn-float" id="btnFloatMuteAudio" title="Voz silenciada en esta pantalla (sale por Servidor Titán DDR3). Clic para escucharla acá.">🔇</button>
+        <button class="btn-float" id="btnFloatHandsFree" title="Alternar Manos Libres">👂</button>
+        <button class="btn-float" id="btnFloatFullscreen" title="Pantalla Completa">⛶</button>
+      </div>
+
+      <!-- Controles Rápidos de la Cara -->
+      <div class="face-quick-actions">
+        <button class="btn-face-action" id="btnFaceMic">
+          <span>🎙</span>
+          <span>HABLAR</span>
+        </button>
+
+        <button class="btn-face-action" id="btnHandsFree" title="Activar escucha continua por voz">
+          <span id="handsFreeIcon">👂</span>
+          <span id="handsFreeLabel">MANOS LIBRES</span>
+        </button>
+
+        <button class="btn-face-action" id="btnToggleCamera">
+          <span>👁</span>
+          <span id="camBtnLabel">OJOS</span>
+        </button>
+      </div>
+
+      <!-- Visor de Cámara Flotante ("Los Ojos de Gemini") -->
+      <div class="camera-visor-card" id="cameraVisor">
+        <div class="visor-header">
+          <span>👁 OJOS DEL ASISTENTE</span>
+          <div class="visor-header-actions">
+            <button class="btn-visor-flip" id="btnFlipCamera" title="Cambiar Cámara (Frontal / Trasera)">🔄</button>
+            <button class="btn-visor-close" id="btnCloseCamera">✕</button>
+          </div>
+        </div>
+        <div class="visor-video-wrapper">
+          <video id="cameraVideo" autoplay playsinline muted></video>
+          <canvas id="cameraCanvas" style="display:none;"></canvas>
+          <input type="file" id="cameraFileInput" accept="image/*" capture="user" style="display:none;">
+          <div class="visor-crosshair"></div>
+        </div>
+        <div class="visor-actions">
+          <div class="visor-cam-indicator" id="camIndicatorLabel">DELANTERA (FRONTAL)</div>
+          <button class="btn-analyze" id="btnAnalyzeCamera">
+            <span>📸 MIRAR Y PREGUNTAR</span>
+          </button>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+
+  <!-- ============================================================ -->
+  <!-- VISTA 2: CENTRO DE CONTROL Y ORBE                            -->
+  <!-- ============================================================ -->
+  <section class="view-container" id="viewOrb">
+    <div class="hud-container">
+      
+      <!-- Zona Central: Orbe Reactivo y Estado -->
+      <div class="hud-core">
+        <div class="orb-wrapper" id="orbWrapper">
+          <div class="wave-ring ring-3"></div>
+          <div class="wave-ring ring-2"></div>
+          <div class="wave-ring ring-1"></div>
+          
+          <div class="core-orb" id="coreOrb">
+            <div class="orb-inner-glow"></div>
+            <div class="orb-particles"></div>
+            <div class="orb-symbol" id="orbIcon">🎙</div>
+          </div>
+        </div>
+
+        <div class="status-box">
+          <div class="status-badge" id="statusBadge">EN ESPERA</div>
+          <p class="status-detail" id="statusDetail">Decí "Che Asistente" o presioná Ctrl+Espacio</p>
+        </div>
+
+        <!-- Botones de Acción Rápida -->
+        <div class="action-buttons">
+          <button class="btn btn-primary" id="btnPushToTalk">
+            <span class="btn-icon">🎙</span>
+            <span>HABLAR</span>
+          </button>
+
+          <button class="btn btn-secondary" id="btnTestVoice">
+            <span class="btn-icon">🔊</span>
+            <span>PROBAR VOZ</span>
+          </button>
+
+          <button class="btn btn-secondary" id="btnStopVoice">
+            <span class="btn-icon">⏹</span>
+            <span>PARAR</span>
+          </button>
+
+          <button class="btn btn-icon-only" id="btnOpenSettings" title="Configurar API Key">
+            ⚙️
+          </button>
+        </div>
+      </div>
+
+      <!-- Panel de Feed / Diálogos -->
+      <div class="hud-feed">
+        <div class="feed-header">
+          <div class="feed-title-wrap">
+            <h2>ACTIVIDAD EN VIVO</h2>
+            <span class="feed-sub" id="historyCount">0 eventos</span>
+          </div>
+          <div class="feed-header-actions">
+            <button type="button" class="btn-feed-action" id="btnExpandChat" title="Extender o reducir chat a pantalla completa">⛶ Extender</button>
+          </div>
+        </div>
+
+        <div class="feed-scroll" id="feedScroll">
+          <div class="feed-empty" id="feedEmpty">
+            <div class="empty-icon">💬</div>
+            <p>Los comandos de voz y acciones se verán acá en tiempo real.</p>
+          </div>
+        </div>
+
+        <!-- Barra de Entrada Manual de Comandos -->
+        <form class="command-bar" id="commandForm">
+          <button type="button" class="btn-cmd-art" id="btnToggleImageMode" title="Pedir a Titán que dibuje o cree una imagen con IA">🎨</button>
+          <input 
+            type="text" 
+            id="cmdInput" 
+            placeholder="Escribí una orden o /imagen (ej: 'dibujame un mate en la luna')..." 
+            autocomplete="off"
+          >
+          <button type="submit" class="btn-send">
+            <span>ENVIAR</span>
+          </button>
+        </form>
+      </div>
+
+    </div>
+  </section>
+
+
+  <!-- ============================================================ -->
+  <!-- VISTA 3: TELEMETRÍA Y RECURSOS DEL SISTEMA                   -->
+  <!-- ============================================================ -->
+  <section class="view-container" id="viewTelemetry">
+    <div class="telemetry-wrapper">
+      
+      <!-- SECCIÓN SUPERIOR: PC PRINCIPAL (WINDOWS) -->
+      <div class="telemetry-section-header">
+        <div class="telem-section-title-group">
+          <h2>🖥️ PC PRINCIPAL (WINDOWS)</h2>
+          <span class="telemetry-sub" id="pcHostnameLabel">Ryzen 5 5600G // Windows</span>
+        </div>
+        <div class="telem-status-badge badge-online" id="pcStatusBadge">
+          <span class="dot"></span>
+          <span id="pcStatusText">CONECTADA</span>
+        </div>
+      </div>
+
+      <div class="telemetry-grid" id="primaryTelemGrid">
+        
+        <!-- Tarjeta de Control Térmico y Refrigeración de PC Principal -->
+        <div class="telem-card telem-thermal-card" id="cardThermalControl">
+          <div class="telem-card-header">
+            <span class="card-icon">🌡️</span>
+            <span>CONTROL TÉRMICO Y REFRIGERACIÓN</span>
+            <span class="thermal-badge badge-optimal" id="thermalStatusBadge">ÓPTIMA</span>
+          </div>
+
+          <div class="thermal-main-display">
+            <div class="thermal-gauge-circle">
+              <span class="thermal-gauge-val" id="thermalTempValue">--.-°C</span>
+              <span class="thermal-gauge-sub" id="thermalPlanLabel">⚖️ Equilibrado</span>
+            </div>
+            
+            <div class="thermal-info-col">
+              <div class="thermal-bar-container">
+                <div class="thermal-bar-track">
+                  <div class="thermal-bar-fill" id="thermalBarFill" style="width: 35%;"></div>
+                </div>
+                <div class="thermal-scale-labels">
+                  <span>30°C (Frío)</span>
+                  <span>60°C</span>
+                  <span>90°C (Crítico)</span>
+                </div>
+              </div>
+
+              <div class="thermal-sensor-grid">
+                <div class="sensor-pill">
+                  <span class="s-label">CPU / APU</span>
+                  <strong class="s-val" id="thermalCpuVal">--.-°C</strong>
+                </div>
+                <div class="sensor-pill">
+                  <span class="s-label">GPU Integrada</span>
+                  <strong class="s-val" id="thermalGpuVal">--.-°C</strong>
+                </div>
+                <div class="sensor-pill">
+                  <span class="s-label">Máx. Sesión</span>
+                  <strong class="s-val" id="thermalMaxVal">--.-°C</strong>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Acciones de Control Térmico y Refrigeración -->
+          <div class="thermal-controls-wrapper">
+            <button class="btn-cool-down" id="btnCoolDown" title="Bajar voltaje, reloj y enfriar la PC al instante">
+              <span class="cool-icon">❄️</span>
+              <span class="cool-text">REFRIGERAR PC AHORA</span>
+              <span class="cool-sub">Modo Frío</span>
+            </button>
+
+            <div class="thermal-profiles-bar">
+              <span class="profiles-title">PERFIL TÉRMICO / ENERGÍA:</span>
+              <div class="profile-buttons-group">
+                <button class="btn-thermal-profile" id="btnPlanEco" data-mode="eco" title="Economizador: Baja temperaturas y silencia ventiladores">
+                  ❄️ Frío (Eco)
+                </button>
+                <button class="btn-thermal-profile active" id="btnPlanBalanced" data-mode="balanced" title="Equilibrado: Balance dinámico normal de Windows">
+                  ⚖️ Equilibrado
+                </button>
+                <button class="btn-thermal-profile" id="btnPlanPerf" data-mode="performance" title="Alto Rendimiento: Máxima potencia para juegos/edición">
+                  🚀 Alto Rend.
+                </button>
+              </div>
+            </div>
+
+            <div class="thermal-alarm-row">
+              <span class="alarm-label">🔔 Alarma Térmica:</span>
+              <select class="thermal-alarm-select" id="thermalAlarmThreshold" title="Avisar por voz si la PC supera esta temperatura">
+                <option value="65">Avisar a 65°C</option>
+                <option value="70">Avisar a 70°C</option>
+                <option value="75" selected>Avisar a 75°C (Recomendado)</option>
+                <option value="80">Avisar a 80°C</option>
+                <option value="85">Avisar a 85°C</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <!-- Tarjeta CPU con Temperatura -->
+        <div class="telem-card">
+          <div class="telem-card-header">
+            <span class="card-icon">⚡</span>
+            <span>PROCESADOR (CPU)</span>
+            <span class="telem-val-big" id="telemCpuTotal">0%</span>
+          </div>
+          <div class="progress-bar-bg">
+            <div class="progress-bar-fill" id="barCpuTotal" style="width: 0%;"></div>
+          </div>
+          <div class="telem-details">
+            <span>Frecuencia: <strong id="telemCpuFreq">-- GHz</strong></span>
+            <span>Núcleos: <strong id="telemCpuCores">--</strong></span>
+            <span>Temp CPU: <strong id="telemCpuTemp" class="temp-badge temp-normal">-- °C</strong></span>
+          </div>
+          <!-- Mini barras de núcleos -->
+          <div class="cores-grid" id="coresGrid"></div>
+        </div>
+
+        <!-- Tarjeta Memoria RAM -->
+        <div class="telem-card">
+          <div class="telem-card-header">
+            <span class="card-icon">🧠</span>
+            <span>MEMORIA RAM</span>
+            <span class="telem-val-big" id="telemRamPercent">0%</span>
+          </div>
+          <div class="progress-bar-bg">
+            <div class="progress-bar-fill fill-ram" id="barRam" style="width: 0%;"></div>
+          </div>
+          <div class="telem-details">
+            <span>En uso: <strong id="telemRamUsed">-- GB</strong></span>
+            <span>Libre: <strong id="telemRamFree">-- GB</strong></span>
+            <span>Total: <strong id="telemRamTotal">-- GB</strong></span>
+          </div>
+        </div>
+
+        <!-- Tarjeta Discos y Almacenamiento -->
+        <div class="telem-card" id="cardDisks">
+          <div class="telem-card-header">
+            <span class="card-icon">💾</span>
+            <span>DISCOS WINDOWS</span>
+          </div>
+          <div class="disks-list" id="disksList">
+            <!-- Rellenado dinámicamente con C, D, E -->
+          </div>
+        </div>
+
+        <!-- Tarjeta Red y Acciones Rápidas de PC -->
+        <div class="telem-card">
+          <div class="telem-card-header">
+            <span class="card-icon">🌐</span>
+            <span>TRÁFICO Y CONTROL</span>
+          </div>
+          <div class="telem-details">
+            <span>Descarga: <strong id="telemNetRecv">-- MB</strong></span>
+            <span>Subida: <strong id="telemNetSent">-- MB</strong></span>
+          </div>
+          <div class="telem-quick-actions">
+            <button class="btn-telem-tool" id="btnTelemAnalyzeScreen" title="Titán analiza lo que tenés abierto en la pantalla con inteligencia artificial">👁️ Mirar Pantalla</button>
+            <button class="btn-telem-tool" id="btnTelemToggleVoice" title="Activar / Silenciar salida de voz de Titán en la PC Principal (por defecto sale por el Servidor DDR3)">🔇 Voz en PC: OFF</button>
+            <button class="btn-telem-tool" id="btnTelemMinimize">🖥 Mostrar Escritorio</button>
+            <button class="btn-telem-tool" id="btnTelemLock">🔒 Bloquear PC</button>
+            <button class="btn-telem-tool" id="btnTelemScreenshot">📸 Captura Pantalla</button>
+          </div>
+        </div>
+
+      </div>
+
+      <!-- SECCIÓN INFERIOR: SERVIDOR TITÁN (DDR3) -->
+      <div class="telemetry-section-header server-section-divider">
+        <div class="telem-section-title-group">
+          <h2>🐧 SERVIDOR TITÁN (DDR3)</h2>
+          <span class="telemetry-sub" id="serverHostLabel">Ubuntu Linux // 192.168.100.5</span>
+        </div>
+        <div class="telem-status-badge badge-server" id="serverStatusBadge">
+          <span class="dot"></span>
+          <span>HOST ACTIVO</span>
+        </div>
+      </div>
+
+      <div class="telemetry-grid server-grid" id="serverTelemGrid">
+        
+        <!-- CPU Servidor con Temp -->
+        <div class="telem-card telem-card-server">
+          <div class="telem-card-header">
+            <span class="card-icon">⚡</span>
+            <span>CPU SERVIDOR</span>
+            <span class="telem-val-big" id="serverCpuVal">0%</span>
+          </div>
+          <div class="progress-bar-bg">
+            <div class="progress-bar-fill" id="barServerCpu" style="width: 0%;"></div>
+          </div>
+          <div class="telem-details">
+            <span>Temp CPU: <strong id="serverCpuTemp" class="temp-badge temp-normal">-- °C</strong></span>
+            <span>Núcleos: <strong id="serverCpuCores">-- hilos</strong></span>
+          </div>
+        </div>
+
+        <!-- RAM Servidor -->
+        <div class="telem-card telem-card-server">
+          <div class="telem-card-header">
+            <span class="card-icon">🧠</span>
+            <span>RAM DDR3</span>
+            <span class="telem-val-big" id="serverRamVal">0%</span>
+          </div>
+          <div class="progress-bar-bg">
+            <div class="progress-bar-fill fill-ram" id="barServerRam" style="width: 0%;"></div>
+          </div>
+          <div class="telem-details">
+            <span>En uso: <strong id="serverRamUsed">-- GB</strong></span>
+            <span>Total: <strong id="serverRamTotal">-- GB</strong></span>
+          </div>
+        </div>
+
+        <!-- Disco Servidor -->
+        <div class="telem-card telem-card-server">
+          <div class="telem-card-header">
+            <span class="card-icon">💾</span>
+            <span>DISCO RAÍZ (/)</span>
+            <span class="telem-val-big" id="serverDiskVal">0%</span>
+          </div>
+          <div class="progress-bar-bg">
+            <div class="progress-bar-fill" id="barServerDisk" style="width: 0%;"></div>
+          </div>
+          <div class="telem-details">
+            <span>Libre: <strong id="serverDiskFree">-- GB</strong></span>
+            <span>Total: <strong id="serverDiskTotal">-- GB</strong></span>
+          </div>
+        </div>
+
+        <!-- Red Servidor -->
+        <div class="telem-card telem-card-server">
+          <div class="telem-card-header">
+            <span class="card-icon">🌐</span>
+            <span>RED SERVIDOR</span>
+          </div>
+          <div class="telem-details">
+            <span>Descarga: <strong id="serverNetRecv">-- MB</strong></span>
+            <span>Subida: <strong id="serverNetSent">-- MB</strong></span>
+          </div>
+        </div>
+
+      </div>
+
+    </div>
+  </section>
+
+  <!-- Modal de Configuración -->
+  <div class="modal-backdrop" id="modalBackdrop">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3>CONFIGURACIÓN DEL ASISTENTE</h3>
+        <button class="btn-close" id="btnCloseModal">✕</button>
+      </div>
+      <div class="modal-body">
+        <label for="apiKeyInput">Google Gemini API Key:</label>
+        <input type="password" id="apiKeyInput" placeholder="AIzaSy...">
+        <p class="modal-hint">Obtené tu clave gratuita en <a href="https://aistudio.google.com/" target="_blank">Google AI Studio</a>.</p>
+        <button class="btn btn-primary btn-save" id="btnSaveKey">GUARDAR CLAVE</button>
+        <div id="keyStatusMsg" class="key-status-msg"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast de Notificaciones de Gestos -->
+  <div id="gestureToast" class="gesture-toast"></div>
+
+  <!-- Modal de Imagen en Pantalla Completa (Lightbox) -->
+  <div class="image-lightbox-modal" id="imageLightboxModal">
+    <div class="lightbox-content">
+      <button type="button" class="lightbox-close-btn" id="btnCloseLightbox" title="Cerrar">✕</button>
+      <img id="lightboxImg" src="" alt="Imagen IA">
+      <div class="lightbox-caption" id="lightboxCaption" style="margin-top: 0.8rem; color: #fff; font-size: 0.9rem; text-align: center; max-width: 90%;"></div>
+    </div>
+  </div>
+
+  <script src="/static/app.js?v=50"></script>
+</body>
+</html>

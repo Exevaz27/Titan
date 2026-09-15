@@ -1,0 +1,14 @@
+{
+  "devices": {
+    "windows-satellite": {
+      "roles": ["satellite"],
+      "enabled": true,
+      "token_sha256": "GENERAR_CON_el_script_de_alta"
+    },
+    "hud-celular": {
+      "roles": ["api"],
+      "enabled": true,
+      "token_sha256": "GENERAR_CON_el_script_de_alta"
+    }
+  }
+}
