@@ -34,7 +34,10 @@ class PresenceDetectorService:
     """
 
     def __init__(self):
-        self.enabled: bool = True
+        # DESACTIVADO por defecto (pedido del usuario 2026-09-15):
+        # la cámara del J2 solo se usa cuando él la pide explícitamente
+        # (vigilancia, foto) o cuando activa el sensor por voz/Telegram.
+        self.enabled: bool = False
         self.absence_threshold: float = 300.0    # 5 minutos sin actividad para considerarse ausente
         self.check_interval: float = 45.0        # Sondeo cada 45s cuando está ausente
         self.cooldown_seconds: float = 1200.0    # 20 minutos de cooldown tras dar una bienvenida
@@ -62,7 +65,10 @@ class PresenceDetectorService:
             return
         self._running = True
         self._loop_task = loop.create_task(self._presence_loop())
-        log_success("[Sensor Presencia] Servicio de presencia frontal J2 iniciado.")
+        if self.enabled:
+            log_success("[Sensor Presencia] Servicio de presencia frontal J2 iniciado.")
+        else:
+            log_success("[Sensor Presencia] Servicio iniciado con sensor automático DESACTIVADO (la cámara del J2 solo se usa a pedido).")
 
     def stop(self):
         """Detiene la tarea de fondo"""
@@ -276,19 +282,28 @@ class PresenceDetectorService:
         if mode == "kids":
             kids_greetings = [
                 "¡Hola Eze! ¡Qué bueno que volviste! ¿Jugamos a algo o me vas a hacer una pregunta?",
-                "¡Ezequiel! Ya estoy listo acá en la pantalla, ¿qué vamos a hacer hoy?"
+                "¡Exequiel! Ya estoy listo acá en la pantalla, ¿qué vamos a hacer hoy?"
             ]
             import random
             return random.choice(kids_greetings)
 
-        if mode == "tertulia":
-            tertulia_greetings = [
+        if mode == "pollera":
+            pollera_greetings = [
+                "¡Buenas! Acá el pollerudo oficial de servicio. ¿La jefa necesita algo?",
+                "¡Presente, fiera! En modo pollera: la patrona manda y yo obedezco.",
+                "¡Qué hacés! Listo para servir a Orianita. ¿En qué andamos?",
+            ]
+            import random
+            return random.choice(pollera_greetings)
+
+        if mode == "termo":
+            termo_greetings = [
                 "¡Buenas fiera! Justo estaba repasando la táctica del Xeneize. ¿Listo para meter debate futbolero?",
                 "¡Volvió el DT! Acomodate che, ¿qué opinás del partido que se viene?",
                 "¡Qué hacés maestro! Firme en la mesa de café, contame qué se debate hoy."
             ]
             import random
-            return random.choice(tertulia_greetings)
+            return random.choice(termo_greetings)
 
         # Modo Normal (Compinche) por franja horaria argentina
         import random

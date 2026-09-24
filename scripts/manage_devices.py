@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 import argparse
+import os
+from pathlib import Path
 
 from core.device_registry import registry
 
@@ -20,9 +22,18 @@ def main() -> int:
 
     if args.command == "enroll":
         token, _ = registry.enroll(args.device_id, args.role)
+        # S-12: el token antes se imprimía en stdout (queda en el scrollback
+        # del terminal y en cualquier log que capture la salida). Solo se
+        # guarda el hash, así que este es el único momento en que existe:
+        # se escribe en un archivo solo-legible por el dueño.
+        safe_id = "".join(c if c.isalnum() or c in "-_" else "_" for c in args.device_id.strip())
+        token_path = Path(f"token-{safe_id}.txt")
+        token_path.write_text(token + "\n", encoding="utf-8")
+        os.chmod(token_path, 0o600)
         print(f"Dispositivo: {args.device_id}")
         print(f"Roles: {', '.join(args.role)}")
-        print(f"Token (guardalo ahora; no se vuelve a mostrar): {token}")
+        print(f"Token guardado en: {token_path} (permisos 600)")
+        print("Copialo al dispositivo y después borrá el archivo.")
         return 0
     if args.command == "revoke":
         if not registry.revoke(args.device_id):

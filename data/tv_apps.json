@@ -1,0 +1,1 @@
+{"_comentario":"Config de apps de la tele BGH. apps_con_vpn: las que SOLO andan detrás de la VPN (siempre se abren por la cadena de vpn_app).","apps_con_vpn":["xupertv"],"vpn_app":"saltamontes"}

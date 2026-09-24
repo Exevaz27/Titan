@@ -4,8 +4,30 @@ import subprocess
 import time
 import re
 import shlex
+import unicodedata
 from typing import Dict, Any, Optional, List, Tuple
 from core.logger import log_info, log_error, log_warning
+from core.reply_variants import pick as reply_pick
+
+
+def _strip_accents(text: str) -> str:
+    """Normaliza un texto quitando tildes, diéresis y la virgulilla de la ñ.
+
+    B-30: antes se reemplazaban a mano solo áéíóú y la ñ quedaba intacta,
+    así "niños" no matcheaba "ninos". Con NFKD la ñ se descompone en
+    n + tilde combinante y al filtrar las marcas se obtiene "n".
+    """
+    return "".join(
+        c for c in unicodedata.normalize("NFKD", text)
+        if unicodedata.category(c) != "Mn"
+    )
+
+
+# S-1: los package names Android tienen un formato estricto. Cualquier
+# candidato que no lo cumpla (ej. "a.b;reboot") se descarta antes de
+# armar el comando monkey, como defensa en profundidad además del
+# citado de argumentos en _run_shell.
+_PKG_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$")
 
 # Configuración por defecto de la tele BGH Android TV
 DEFAULT_TV_IP = "192.168.100.8"
@@ -76,6 +98,13 @@ KEY_CODES = {
     "mute": 164,       # KEYCODE_VOLUME_MUTE
     "vol_up": 24,      # KEYCODE_VOLUME_UP
     "vol_down": 25     # KEYCODE_VOLUME_DOWN
+}
+
+# Entradas HDMI reales de la BGH (MediaTek), descubiertas vía dumpsys tv_input:
+# HW4 = puerto HDMI 1, HW5 = puerto HDMI 2. La tele solo tiene 2 HDMI.
+HDMI_INPUT_IDS = {
+    1: "com.mediatek.tvinput/.hdmi.HDMIInputService/HW4",
+    2: "com.mediatek.tvinput/.hdmi.HDMIInputService/HW5",
 }
 
 # Catálogo completo de 97 canales de OnPlay extraído de ClayTVv2.m3u
@@ -270,6 +299,17 @@ CHANNEL_ALIASES: Dict[str, int] = {
 }
 
 
+# Cadena Saltamontes -> XuperTV (tiempos medidos por Exequiel, 2026-09-22):
+# la VPN tarda ~5s en conectar desde que abre la app, XuperTV abre sola a
+# los 10-15s y la VPN se desactiva sola a los 30-35s (no hay que tocar nada).
+_VPN_FIRST_WAIT = 20.0    # espera inicial a que XuperTV tome la pantalla
+_VPN_SECOND_WAIT = 20.0   # espera extra tras OK (reintento de conexión VPN)
+_VPN_LOAD_WAIT = 8.0      # espera a que XuperTV termine de cargar
+_VPN_MAX_ATTEMPTS = 2     # reintentos completos ante el cartel de la política
+_VPN_POLL_STEP = 2.0
+_VPN_LAUNCH_WAIT = 10.0   # espera a que Saltamontes aparezca en primer plano tras lanzarla
+
+
 class TVControl:
     """
     Controlador inteligente para la BGH Android TV (192.168.100.8).
@@ -283,6 +323,27 @@ class TVControl:
         self.target = f"{self.ip}:{self.port}"
         self._adb_path = self._find_adb()
         self._last_connected_time = 0.0
+        self._tv_apps = self._load_tv_apps()
+
+    def _load_tv_apps(self) -> Dict[str, Any]:
+        """Lee data/tv_apps.json (app de VPN y apps que la necesitan).
+
+        Si el archivo no existe o está roto, usa los defaults: la VPN es
+        Saltamontes y XuperTV siempre se abre a través de ella.
+        """
+        default: Dict[str, Any] = {"vpn_app": "saltamontes", "apps_con_vpn": ["xupertv"]}
+        try:
+            import json
+            base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            path = os.path.join(base, "data", "tv_apps.json")
+            if os.path.exists(path):
+                with open(path, encoding="utf-8") as f:
+                    cfg = json.load(f)
+                if isinstance(cfg, dict):
+                    default.update(cfg)
+        except Exception as e:
+            log_warning(f"[TVControl] No se pudo leer tv_apps.json, uso defaults: {e}")
+        return default
 
     def _find_adb(self) -> str:
         """Localiza el binario de adb tanto en Windows como en Linux DDR3"""
@@ -330,11 +391,19 @@ class TVControl:
         return False
 
     def _run_shell(self, cmd_str: str, timeout: float = 6.0) -> Tuple[bool, str]:
-        """Ejecuta un comando ADB sin pasar por un shell local."""
+        """Ejecuta un comando ADB sin pasar por un shell local ni remoto.
+
+        S-1: `adb shell` re-ensambla sus argumentos con espacios y el shell
+        de Android los interpreta. Por eso cada argumento se cita con
+        shlex.quote() y se envía como un único argumento: el shell del
+        dispositivo lo parsea respetando las comillas, así `;`, `$()`,
+        backticks, `|` o `&&` llegan como texto literal y no se ejecutan.
+        """
         try:
             self._ensure_connected()
             remote_args = shlex.split(cmd_str, posix=True)
-            full_cmd = [self._adb_path, "-s", self.target, "shell", *remote_args]
+            remote_cmd = " ".join(shlex.quote(a) for a in remote_args)
+            full_cmd = [self._adb_path, "-s", self.target, "shell", remote_cmd]
             res = subprocess.run(full_cmd, capture_output=True, text=True, timeout=timeout)
             out = res.stdout.strip()
             if res.returncode != 0 and ("not found" in out.lower() or "offline" in out.lower()):
@@ -369,31 +438,72 @@ class TVControl:
     def turn_on(self) -> Dict[str, Any]:
         """Enciende la tele BGH desde standby"""
         if self.is_awake():
-            return {"status": "success", "message": "La tele ya está prendida, papá."}
+            return {"status": "success", "message": reply_pick("tv.already_on")}
         
         self._run_shell("input keyevent 224")
         time.sleep(0.5)
         if not self.is_awake():
             self._run_shell("input keyevent 26")
             
-        return {"status": "success", "message": "Listo fiera, tele prendida."}
+        return {"status": "success", "message": reply_pick("tv.turn_on")}
 
     def turn_off(self) -> Dict[str, Any]:
         """Apaga o pone la tele en modo reposo/standby"""
         if not self.is_awake():
-            return {"status": "success", "message": "La tele ya está apagada, che."}
+            return {"status": "success", "message": reply_pick("tv.already_off")}
             
         self._run_shell("input keyevent 223")
         time.sleep(0.5)
         if self.is_awake():
             self._run_shell("input keyevent 26")
             
-        return {"status": "success", "message": "Listo papá, tele apagada."}
+        return {"status": "success", "message": reply_pick("tv.turn_off")}
 
     def power_toggle(self) -> Dict[str, Any]:
         """Alterna encendido/apagado de la tele"""
         self._run_shell("input keyevent 26")
-        return {"status": "success", "message": "Comando de encendido/apagado enviado a la tele."}
+        return {"status": "success", "message": reply_pick("tv.toggle")}
+
+    def set_hdmi(self, port: int = 1) -> Dict[str, Any]:
+        """Cambia la entrada de la tele a HDMI 1-2 vía intent de passthrough de Android TV.
+
+        Los keycodes 243-246 no están mapeados en esta BGH, así que se usa el
+        método oficial: ACTION_VIEW sobre content://android.media.tv/passthrough/<inputId>
+        con el inputId URL-encodeado (descubierto vía dumpsys tv_input).
+        """
+        if port not in HDMI_INPUT_IDS:
+            return {"status": "error", "message": "La tele solo tiene HDMI 1 y 2, fiera. Pedime uno de esos."}
+        if not self.is_awake():
+            self.turn_on()
+            time.sleep(1.0)
+        input_id = HDMI_INPUT_IDS[port].replace("/", "%2F")
+        uri = f"content://android.media.tv/passthrough/{input_id}"
+        ok, out = self._run_shell(f"am start -a android.intent.action.VIEW -d {uri}", timeout=8.0)
+        time.sleep(1.5)
+        failed = (not ok) or ("error" in out.lower()) or ("not found" in out.lower())
+        if failed:
+            log_warning(f"[TVControl] Falló cambio a HDMI {port}: {out}")
+            return {"status": "error", "message": f"No pude pasar a HDMI {port}, che. Probá con el control."}
+        log_info(f"[TVControl] Entrada cambiada a HDMI {port}")
+        return {"status": "success", "message": reply_pick("tv.hdmi", port=port)}
+
+    def set_tv_input(self) -> Dict[str, Any]:
+        """Cambia la entrada de la tele al sintonizador de TV (aire/cable, keycode 178)"""
+        if not self.is_awake():
+            self.turn_on()
+            time.sleep(1.0)
+        self._run_shell("input keyevent 178")
+        time.sleep(0.8)
+        log_info("[TVControl] Entrada cambiada a sintonizador de TV")
+        return {"status": "success", "message": reply_pick("tv.tv_input")}
+
+    def go_home(self) -> Dict[str, Any]:
+        """Vuelve al inicio (launcher) de Android TV (keycode 3)"""
+        if not self.is_awake():
+            self.turn_on()
+            time.sleep(1.0)
+        self._run_shell("input keyevent 3")
+        return {"status": "success", "message": reply_pick("tv.go_home")}
 
     def volume_up(self, steps: int = 1) -> Dict[str, Any]:
         """Sube el volumen de la tele"""
@@ -401,7 +511,7 @@ class TVControl:
         for _ in range(steps):
             self._run_shell("input keyevent 24")
             time.sleep(0.05)
-        return {"status": "success", "message": f"Subí el volumen de la tele {steps} punto{'s' if steps > 1 else ''}."}
+        return {"status": "success", "message": reply_pick("tv.volume_up", steps=steps, s="s" if steps > 1 else "")}
 
     def volume_down(self, steps: int = 1) -> Dict[str, Any]:
         """Baja el volumen de la tele"""
@@ -409,33 +519,33 @@ class TVControl:
         for _ in range(steps):
             self._run_shell("input keyevent 25")
             time.sleep(0.05)
-        return {"status": "success", "message": f"Bajé el volumen de la tele {steps} punto{'s' if steps > 1 else ''}."}
+        return {"status": "success", "message": reply_pick("tv.volume_down", steps=steps, s="s" if steps > 1 else "")}
 
     def mute(self) -> Dict[str, Any]:
         """Mutea o desmutea el volumen de la tele"""
         self._run_shell("input keyevent 164")
-        return {"status": "success", "message": "Muteé la tele, fiera."}
+        return {"status": "success", "message": reply_pick("tv.mute")}
 
     def set_volume(self, level: int) -> Dict[str, Any]:
         """Fija el nivel de volumen en la tele (0 a 100)"""
         level = max(0, min(level, 100))
         self._run_shell(f"cmd media_session volume --stream 3 --set {level}")
-        return {"status": "success", "message": f"Puse el volumen de la tele en {level}."}
+        return {"status": "success", "message": reply_pick("tv.set_volume", level=level)}
 
     def play_pause(self) -> Dict[str, Any]:
         """Alterna Play / Pausa en la tele"""
         self._run_shell("input keyevent 85")
-        return {"status": "success", "message": "Listo, alterné play/pausa en la tele."}
+        return {"status": "success", "message": reply_pick("tv.play_pause")}
 
     def next_track(self) -> Dict[str, Any]:
         """Pasa al siguiente video o capítulo en la tele"""
         self._run_shell("input keyevent 87")
-        return {"status": "success", "message": "Pasé al siguiente en la tele."}
+        return {"status": "success", "message": reply_pick("tv.next")}
 
     def prev_track(self) -> Dict[str, Any]:
         """Vuelve al video o capítulo anterior en la tele"""
         self._run_shell("input keyevent 88")
-        return {"status": "success", "message": "Volví al anterior en la tele."}
+        return {"status": "success", "message": reply_pick("tv.previous")}
 
     def send_key(self, key_name: str) -> Dict[str, Any]:
         """Envía una tecla de navegación del control remoto a la tele"""
@@ -444,65 +554,210 @@ class TVControl:
         if not code:
             return {"status": "error", "message": f"No reconozco la tecla '{key_name}'."}
         self._run_shell(f"input keyevent {code}")
-        return {"status": "success", "message": f"Tecla {key_name} enviada a la tele."}
+        return {"status": "success", "message": reply_pick("tv.send_key", key=key_name)}
 
     def type_text(self, text: str) -> Dict[str, Any]:
         """Escribe un texto en el buscador o campo activo de la tele"""
         safe_text = text.replace(" ", "%s").replace("'", "").replace('"', "")
         self._run_shell(f"input text {safe_text}")
-        return {"status": "success", "message": f"Escribí '{text}' en la tele, papá."}
+        return {"status": "success", "message": reply_pick("tv.type_text", text=text)}
 
-    def open_app(self, app_name: str) -> Dict[str, Any]:
-        """Abre una aplicación en la tele por su nombre común o paquete"""
-        q = app_name.lower().strip()
-        
+    def _discover_package(self, query: str) -> Optional[str]:
+        """Busca en la tele un paquete instalado cuyo nombre contenga el texto.
+
+        Sirve para apps fuera del catálogo (XuperTV, Ukiku, etc.) cuyos
+        package names varían según la build instalada.
+        """
+        ok, out = self._run_shell("pm list packages", timeout=10.0)
+        if not ok or not out:
+            return None
+        q = query.lower().replace(" ", "")
+        for line in out.splitlines():
+            line = line.strip()
+            if not line.startswith("package:"):
+                continue
+            pkg = line[len("package:"):]
+            if q and q in pkg.lower():
+                log_info(f"[TVControl] Paquete descubierto para '{query}': {pkg}")
+                return pkg
+        return None
+
+    def _launch_package(self, pkg: str) -> bool:
+        """Lanza un paquete con monkey. True si el sistema confirma con
+        'Events injected' (no basta con que el comando no falle)."""
+        # S-1: descartar cualquier cosa que no sea un package name válido
+        # antes de interpolarlo en el comando monkey.
+        if not _PKG_RE.match(pkg):
+            log_warning(f"[TVControl] Paquete inválido, se ignora: {pkg!r}")
+            return False
+        ok, out = self._run_shell(f"monkey -p {pkg} -c android.intent.category.LAUNCHER 1")
+        if not (ok and "events injected" in out.lower()):
+            log_warning(f"[TVControl] No abrió {pkg}: {out[:120]}")
+            return False
+        return True
+
+    def _foreground_has(self, pkg: str) -> bool:
+        """True si el paquete está en la ventana enfocada ahora mismo."""
+        _, _, focused = self.get_focused_window()
+        return bool(pkg and pkg in focused)
+
+    def _wait_foreground(self, pkg: str, timeout: float) -> bool:
+        """Espera (polling) a que el paquete tome la pantalla."""
+        end = time.time() + timeout
+        while time.time() < end:
+            if self._foreground_has(pkg):
+                return True
+            time.sleep(_VPN_POLL_STEP)
+        return self._foreground_has(pkg)
+
+    def _wait_foreground_left(self, pkg: str, timeout: float) -> bool:
+        """Espera (polling) a que el paquete DEJE la pantalla.
+
+        Se usa en la cadena VPN: Saltamontes abre XuperTV sola, así que el
+        éxito es que la VPN ya no esté en primer plano (no hace falta saber
+        el nombre interno del paquete de XuperTV).
+        """
+        end = time.time() + timeout
+        while time.time() < end:
+            if not self._foreground_has(pkg):
+                return True
+            time.sleep(_VPN_POLL_STEP)
+        return not self._foreground_has(pkg)
+
+    def _has_geo_cartel(self) -> bool:
+        """Detecta el cartel de 'limitación de la política' de XuperTV
+        (la VPN se desactivó antes de que la app termine de cargar).
+
+        Se lee con uiautomator dump y se buscan las marcas del cartel
+        normalizadas (sin acentos): 'limitación de la política',
+        'no se puede usar en tu área' y 'distribuidor'.
+        """
+        ok, out = self._run_shell("uiautomator dump /dev/stdout", timeout=10.0)
+        if not ok or not out:
+            return False
+        t = _strip_accents(out.lower())
+        return (("limitaci" in t and "tu area" in t) or "distribuidor" in t)
+
+    def _open_via_vpn(self, target_name: str) -> Dict[str, Any]:
+        """Abre una app que solo anda detrás de la VPN (XuperTV) con la
+        cadena de Saltamontes, replicando el procedimiento manual de Exequiel.
+
+        NO necesita conocer el paquete de la app objetivo: Saltamontes la
+        abre sola, así que el éxito es que la VPN DEJE de estar en primer
+        plano (XuperTV tomó la pantalla).
+
+        1. Abre la app de la VPN y espera a que tome la pantalla.
+        2. Espera a que la VPN deje el primer plano: XuperTV abrió sola
+           (la VPN tarda ~5s en conectar; XuperTV abre sola a los 10-15s).
+        3. Error 1: si la VPN sigue al frente, se toca OK (reintenta la
+           conexión VPN, como hace él con el control) y se espera de nuevo.
+        4. Error 2: si salió el cartel de limitación de la política (la VPN
+           se desactivó antes de que XuperTV termine de cargar), se toca
+           ATRÁS y se arranca la cadena de nuevo (máx. _VPN_MAX_ATTEMPTS).
+        5. Si todo falla, se sugiere el fallback a Cloudstream (el que
+           decide es Exequiel, no se abre solo).
+        """
+        vpn_query = str(self._tv_apps.get("vpn_app", "saltamontes"))
+        vpn_pkg = self._discover_package(vpn_query)
+        if not vpn_pkg:
+            return {"status": "error", "suggest_fallback": True,
+                    "message": f"No encontré la app de la VPN ({vpn_query}) instalada en la tele."}
+
         if not self.is_awake():
             self.turn_on()
             time.sleep(1.0)
 
+        for attempt in range(1, _VPN_MAX_ATTEMPTS + 1):
+            log_info(f"[TVControl] Cadena VPN intento {attempt}/{_VPN_MAX_ATTEMPTS}: {vpn_pkg}")
+            if not self._launch_package(vpn_pkg):
+                continue
+            # Confirmar que Saltamontes tomó la pantalla antes de esperar
+            # que la abandone (si no, el launcher al fondo daría un
+            # falso "éxito" inmediato).
+            if not self._wait_foreground(vpn_pkg, _VPN_LAUNCH_WAIT):
+                log_warning("[TVControl] Saltamontes no tomó la pantalla")
+                continue
+            if not self._wait_foreground_left(vpn_pkg, _VPN_FIRST_WAIT):
+                log_info("[TVControl] La app no apareció; toco OK para reintentar la VPN")
+                self._run_shell("input keyevent 66", timeout=2.5)
+                if not self._wait_foreground_left(vpn_pkg, _VPN_SECOND_WAIT):
+                    log_warning("[TVControl] La VPN no conectó tras el reintento")
+                    continue
+            time.sleep(_VPN_LOAD_WAIT)
+            if self._has_geo_cartel():
+                log_warning("[TVControl] Cartel de limitación de política; cierro y reintento")
+                self._run_shell("input keyevent 4", timeout=2.5)
+                time.sleep(1.5)
+                continue
+            log_info("[TVControl] App abierta y cargada vía VPN")
+            return {"status": "success",
+                    "message": reply_pick("tv.xuper_ok")}
+
+        return {"status": "error", "suggest_fallback": True,
+                "message": reply_pick("tv.xuper_fail")}
+
+    def open_app(self, app_name: str) -> Dict[str, Any]:
+        """Abre una aplicación en la tele por su nombre común o paquete.
+
+        Las apps de apps_con_vpn (XuperTV) SIEMPRE se abren por la cadena de
+        la VPN: abrirlas directo nace muerta por el bloqueo geográfico.
+
+        Si no está en el catálogo, descubre el paquete real instalado en la tele
+        y prueba cada candidato hasta que uno abra de verdad (monkey confirma
+        con 'Events injected', no basta con que el comando no falle).
+        """
+        q = app_name.lower().strip()
+
+        # XuperTV (y las que se sumen) jamás se abren directo: van por la VPN.
+        if q in [a.lower() for a in self._tv_apps.get("apps_con_vpn", [])]:
+            return self._open_via_vpn(q)
+
+        if not self.is_awake():
+            self.turn_on()
+            time.sleep(1.0)
+
+        candidates: List[str] = []
         pkg = APP_PACKAGES.get(q)
         if not pkg:
             for k, v in APP_PACKAGES.items():
                 if k in q or q in k:
                     pkg = v
                     break
+        if pkg:
+            candidates.append(pkg)
+        disc = self._discover_package(q)
+        if disc and disc not in candidates:
+            candidates.append(disc)
+        if "." in q and q not in candidates:
+            candidates.append(q)
 
-        if not pkg:
-            if "." in q:
-                pkg = q
-            else:
-                return {
-                    "status": "error",
-                    "message": f"No encontré la app '{app_name}' en la tele. Probá con YouTube, OnPlay, Netflix, VLC, etc."
-                }
-
-        ok, out = self._run_shell(f"monkey -p {pkg} -c android.intent.category.LAUNCHER 1")
-        
         display_names = {
             "ar.com.onplay.tv": "OnPlay TV",
             "org.smarttube.stable": "SmartTube (YouTube)",
             "com.netflix.ninja": "Netflix",
             "com.google.android.youtube.tv": "YouTube",
             "org.videolan.vlc": "VLC",
-            "com.spotify.tv.android": "Spotify"
+            "com.spotify.tv.android": "Spotify",
+            "com.lagradost.cloudstream3.prereleasf": "Cloudstream",
         }
-        name_clean = display_names.get(pkg, app_name.capitalize())
-        
-        if ok:
-            log_info(f"[TVControl] App abierta con éxito: {pkg} ({name_clean})")
-            return {"status": "success", "message": f"Ahí te abrí {name_clean} en la tele, papá."}
-        else:
-            log_warning(f"[TVControl] Error abriendo {pkg}: {out}")
-            return {"status": "error", "message": f"No pude abrir {name_clean} en la tele."}
+
+        for cand in candidates:
+            if self._launch_package(cand):
+                name_clean = display_names.get(cand, app_name.capitalize())
+                log_info(f"[TVControl] App abierta con éxito: {cand} ({name_clean})")
+                return {"status": "success", "message": reply_pick("tv.open_app", app=name_clean)}
+
+        return {
+            "status": "error",
+            "message": f"No encontré la app '{app_name}' en la tele. Probá con YouTube, OnPlay, Netflix, VLC, etc."
+        }
 
     def resolve_channel(self, query: str) -> Optional[Tuple[int, str]]:
         """
         Resuelve un texto o número al canal exacto de OnPlay (de 1 a 97).
         Devuelve (channel_number, channel_title) o None.
         """
-        q = query.lower().strip()
-        for a, b in [("á", "a"), ("é", "e"), ("í", "i"), ("ó", "o"), ("ú", "u")]:
-            q = q.replace(a, b)
+        q = _strip_accents(query.lower().strip())
 
         clean_q = q
         # Quitar palabras de relleno y frases introductorias
@@ -538,9 +793,7 @@ class TVControl:
 
         # 4. Coincidencia directa con nombres de canales (normalizados)
         for num, (title, cat) in ONPLAY_CHANNELS.items():
-            t_clean = title.lower()
-            for a, b in [("á", "a"), ("é", "e"), ("í", "i"), ("ó", "o"), ("ú", "u")]:
-                t_clean = t_clean.replace(a, b)
+            t_clean = _strip_accents(title.lower())
             t_clean = re.sub(r'\b(hd|tv)\b', '', t_clean).strip()
             t_clean = " ".join(t_clean.split())
             if clean_q and clean_q == t_clean:
@@ -555,9 +808,7 @@ class TVControl:
 
         # 6. Coincidencia segura (evitando que nombres cortos como "TN" coincidan con "TNT")
         for num, (title, cat) in ONPLAY_CHANNELS.items():
-            t_clean = title.lower()
-            for a, b in [("á", "a"), ("é", "e"), ("í", "i"), ("ó", "o"), ("ú", "u")]:
-                t_clean = t_clean.replace(a, b)
+            t_clean = _strip_accents(title.lower())
             t_clean = re.sub(r'\b(hd|tv)\b', '', t_clean).strip()
             t_clean = " ".join(t_clean.split())
             if not clean_q or not t_clean:
@@ -661,7 +912,7 @@ class TVControl:
             "status": "success",
             "channel_number": ch_num,
             "channel_name": ch_title,
-            "message": f"¡De una, papá! Puse {ch_title} (Canal {ch_num}) en OnPlay."
+            "message": reply_pick("tv.tune_channel", channel=ch_title, num=ch_num)
         }
 
     def open_onplay_live(self, channel_name_or_number: Optional[str] = None) -> Dict[str, Any]:
@@ -699,7 +950,7 @@ class TVControl:
 
         return {
             "status": "success",
-            "message": "¡De una, fiera! Ahí te prendí la tele y te abrí OnPlay en TV en vivo."
+            "message": reply_pick("tv.onplay_tv")
         }
 
     def list_channels(self, category: Optional[str] = None) -> List[Dict[str, Any]]:

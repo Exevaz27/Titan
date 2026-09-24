@@ -31,12 +31,18 @@ class NotificationService:
             # Fallback a PowerShell si winotify falla
             try:
                 from core.process_utils import run_silent
+                # S-17: title/message se interpolaban sin escape dentro del
+                # script (una comilla " lo rompía; inyección si el texto
+                # viniera de una fuente no confiable). En strings PowerShell
+                # con comillas dobles hay que escapar `, $ y ".
+                ps_title = str(title).replace("`", "``").replace("$", "`$").replace('"', '`"')
+                ps_message = str(message).replace("`", "``").replace("$", "`$").replace('"', '`"')
                 ps_script = f"""
                 [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null
                 $template = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02)
                 $texts = $template.GetElementsByTagName("text")
-                $texts.Item(0).AppendChild($template.CreateTextNode("{title}")) > $null
-                $texts.Item(1).AppendChild($template.CreateTextNode("{message}")) > $null
+                $texts.Item(0).AppendChild($template.CreateTextNode("{ps_title}")) > $null
+                $texts.Item(1).AppendChild($template.CreateTextNode("{ps_message}")) > $null
                 $toast = [Windows.UI.Notifications.ToastNotification]::new($template)
                 [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("{self.app_id}").Show($toast)
                 """

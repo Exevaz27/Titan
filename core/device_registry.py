@@ -6,6 +6,8 @@ import secrets
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
+from core.json_store import atomic_write_json, json_locked
+
 
 REGISTRY_PATH = Path(__file__).resolve().parent.parent / "authorized_devices.json"
 
@@ -41,23 +43,47 @@ class DeviceRegistry:
         if not clean_id or not roles:
             raise ValueError("El dispositivo necesita un ID y al menos un rol")
         token = secrets.token_urlsafe(32)
-        data = self._load()
-        data["devices"][clean_id] = {
-            "roles": sorted(set(roles)),
-            "enabled": True,
-            "token_sha256": self._hash_token(token),
-        }
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        # R-6: la actualización es read-modify-write bajo lock exclusivo
+        # (hilos + otros procesos) y la escritura es atómica: dos enrolamientos
+        # concurrentes ya no se pisan, y un corte a mitad de escritura no deja
+        # un JSON truncado.
+        with json_locked(self.path):
+            data = self._load()
+            data["devices"][clean_id] = {
+                "roles": sorted(set(roles)),
+                "enabled": True,
+                "token_sha256": self._hash_token(token),
+            }
+            atomic_write_json(self.path, data)
         return token, data["devices"][clean_id]
 
     def revoke(self, device_id: str) -> bool:
-        data = self._load()
-        device = data["devices"].get(device_id)
-        if not device:
+        with json_locked(self.path):
+            data = self._load()
+            device = data["devices"].get(device_id)
+            if not device:
+                return False
+            device["enabled"] = False
+            atomic_write_json(self.path, data)
+        return True
+
+    def grant_role(self, device_id: str, role: str) -> bool:
+        """S-4: agrega un rol a un dispositivo existente (migración al rol
+        admin). Devuelve True si el rol se agregó."""
+        clean_id = device_id.strip()
+        if not clean_id or not role:
             return False
-        device["enabled"] = False
-        self.path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        with json_locked(self.path):
+            data = self._load()
+            device = data["devices"].get(clean_id)
+            if not device or not device.get("enabled", True):
+                return False
+            roles = set(device.get("roles", []))
+            if role in roles:
+                return False
+            roles.add(role)
+            device["roles"] = sorted(roles)
+            atomic_write_json(self.path, data)
         return True
 
     def list_devices(self) -> Dict[str, Any]:

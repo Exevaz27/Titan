@@ -1,10 +1,18 @@
 document.addEventListener('DOMContentLoaded', () => {
   let ws = null;
   let reconnectTimer = null;
+  let wsReconnectDelay = 1000; // backoff exponencial para el WS principal (1s -> 30s tope)
+  let micReconnectDelay = 1000; // idem para el WS del micrófono
   let currentState = 'IDLE';
   let activeCameraStream = null;
   let speechRecognizer = null;
   let isRebelMode = false;
+
+  // Versión de assets (CSS/JS). El servidor publica la suya en init_snapshot;
+  // si difieren, esta pestaña quedó con archivos viejos en caché y se recarga
+  // sola (el J2 queda prendido semanas con el Fully Kiosk abierto).
+  // FIX 2026-09-23 (bug pava del mate).
+  const APP_ASSET_VERSION = 52;
 
   // Elementos DOM
   const body = document.body;
@@ -20,8 +28,10 @@ document.addEventListener('DOMContentLoaded', () => {
   const eyebrowLeft = document.getElementById('eyebrowLeft');
   const eyebrowRight = document.getElementById('eyebrowRight');
   const mouthMesh = document.getElementById('mouthMesh');
+  const caraEl = document.getElementById('cara');
   const mouthCavity = document.getElementById('mouthCavity');
   const faceSpeechText = document.getElementById('faceSpeechText');
+  const faceSpeechBubble = document.getElementById('faceSpeechBubble');
   const btnFaceMic = document.getElementById('btnFaceMic');
   const btnToggleCamera = document.getElementById('btnToggleCamera');
   const cameraVisor = document.getElementById('cameraVisor');
@@ -73,17 +83,28 @@ document.addEventListener('DOMContentLoaded', () => {
   let totalEvents = 0;
   let currentAssistantMode = 'normal';
 
+  // Metadatos de modos para el selector colapsable (2026-09-17)
+  const MODE_META = {
+    normal:   { emoji: '🟢', label: 'COMPINCHE',  color: '#00e676' },
+    kids:     { emoji: '🟡', label: 'PIBES (ATP)', color: '#ffb703' },
+    rebel:    { emoji: '🔴', label: 'REBELDE',    color: '#ff3366' },
+    termo: { emoji: '⚽', label: 'MODO TERMO', color: '#b388ff' },
+    pollera: { emoji: '🌸', label: 'MODO POLLERA', color: '#ff7ab8' },
+  };
+
   function updateActiveMode(mode) {
     currentAssistantMode = mode || 'normal';
     isRebelMode = (currentAssistantMode === 'rebel');
 
-    body.classList.remove('mode-rebel', 'mode-kids', 'mode-tertulia');
+    body.classList.remove('mode-rebel', 'mode-kids', 'mode-termo', 'mode-pollera');
     if (currentAssistantMode === 'rebel') {
       body.classList.add('mode-rebel');
     } else if (currentAssistantMode === 'kids') {
       body.classList.add('mode-kids');
-    } else if (currentAssistantMode === 'tertulia') {
-      body.classList.add('mode-tertulia');
+    } else if (currentAssistantMode === 'termo') {
+      body.classList.add('mode-termo');
+    } else if (currentAssistantMode === 'pollera') {
+      body.classList.add('mode-pollera');
     }
 
     document.querySelectorAll('.mode-pill').forEach(pill => {
@@ -93,6 +114,16 @@ document.addEventListener('DOMContentLoaded', () => {
         pill.classList.remove('active');
       }
     });
+
+    // Refleja el modo actual en la píldora colapsada (2026-09-17)
+    const meta = MODE_META[currentAssistantMode] || MODE_META.normal;
+    const curDot = document.getElementById('modeCurrentDot');
+    const curLabel = document.getElementById('modeCurrentLabel');
+    const curBtn = document.getElementById('modeCurrent');
+    if (curDot) curDot.textContent = meta.emoji;
+    if (curLabel) curLabel.textContent = meta.label;
+    if (curBtn) curBtn.style.setProperty('--mc', meta.color);
+    refreshPolleraFace();
   }
 
   function updateSpeakerBadge(speakerType, pitchHz) {
@@ -121,12 +152,98 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
+  // Huella de voz (2026-09-17, multi-voz 2026-09-18): superpone la identidad
+  // a la insignia de voz. Solo llega cuando hay huellas registradas:
+  // "desconocido" = ninguna coincide.
+  function updateIdentityBadge(identity, score, display) {
+    const badge = document.getElementById('speakerBadge');
+    const nameSpan = document.getElementById('speakerName');
+    const iconSpan = document.getElementById('speakerIcon');
+    if (!badge || !nameSpan || !iconSpan) return;
+
+    badge.classList.remove('detected-owner', 'detected-unknown-person');
+    if (identity && identity !== 'desconocido') {
+      badge.classList.add('detected-owner');
+      iconSpan.textContent = '✅';
+      nameSpan.textContent = display || identity;
+    } else {
+      badge.classList.add('detected-unknown-person');
+      iconSpan.textContent = '❓';
+      nameSpan.textContent = 'Otra persona';
+    }
+  }
+
+  // ============================================================
+  // MODO POLLERA: EXPRESIONES FACIALES (2026-09-18)
+  // Capa 1 (base): la voz de Oriana -> enamorado. Queda hasta que hable
+  // otra voz o cambie el modo.
+  // Capa 2 (fija): [cara:retado]/[cara:enojado] del cerebro; queda puesta
+  // mientras dure el tema y la saca [cara:normal] (2026-09-18). Red de
+  // seguridad: si no llega la limpieza, vuelve sola a los 120s.
+  // En reposo o hablando otro, la cara queda idéntica a la normal.
+  // ============================================================
+  let lastSpeakerIdentity = null;
+  let polleraTransient = null;
+  let polleraTransientTimer = null;
+
+  function refreshPolleraFace() {
+    const inPollera = body.classList.contains('mode-pollera');
+    const love = inPollera && lastSpeakerIdentity === 'oriana' && !polleraTransient;
+    body.classList.toggle('pollera-love', love);
+    body.classList.toggle('pollera-scold', inPollera && polleraTransient === 'retado');
+    body.classList.toggle('pollera-mad', inPollera && polleraTransient === 'enojado');
+    if (!inPollera && polleraTransientTimer) {
+      clearTimeout(polleraTransientTimer);
+      polleraTransientTimer = null;
+      polleraTransient = null;
+    }
+  }
+
+  function setPolleraTransient(expression, ttlSeconds) {
+    if (polleraTransientTimer) {
+      clearTimeout(polleraTransientTimer);
+      polleraTransientTimer = null;
+    }
+    if (expression === 'retado' || expression === 'enojado') {
+      polleraTransient = expression;  // queda fija hasta [cara:normal]
+      polleraTransientTimer = setTimeout(() => {
+        polleraTransient = null;
+        polleraTransientTimer = null;
+        refreshPolleraFace();
+      }, 120000);
+    } else {
+      // 'normal' (o cualquier otro valor): limpia la expresión fija
+      polleraTransient = null;
+    }
+    refreshPolleraFace();
+  }
+
   function initModeBar() {
+    const modeSelect = document.getElementById('modeSelect');
+    const modeCurrent = document.getElementById('modeCurrent');
+
+    // Selector colapsable: tocar la píldora despliega/cierra el menú (2026-09-17)
+    if (modeCurrent && modeSelect) {
+      modeCurrent.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const open = modeSelect.classList.toggle('open');
+        modeCurrent.setAttribute('aria-expanded', open ? 'true' : 'false');
+      });
+      document.addEventListener('click', () => {
+        modeSelect.classList.remove('open');
+        modeCurrent.setAttribute('aria-expanded', 'false');
+      });
+    }
+
     document.querySelectorAll('.mode-pill').forEach(pill => {
       pill.addEventListener('click', (e) => {
         e.stopPropagation();
         const mode = pill.dataset.mode;
         updateActiveMode(mode);
+        if (modeSelect) {
+          modeSelect.classList.remove('open');
+          if (modeCurrent) modeCurrent.setAttribute('aria-expanded', 'false');
+        }
         if (ws && ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({ type: 'set_mode', mode: mode }));
         } else {
@@ -294,6 +411,22 @@ document.addEventListener('DOMContentLoaded', () => {
   // ============================================================
   // CONEXIÓN WEBSOCKET
   // ============================================================
+  // Backoff exponencial con jitter: si el servidor está caído, el HUD
+  // no lo martilla cada 2s fijo; espera 1s, 2s, 4s... hasta 30s tope.
+  function scheduleWsReconnect() {
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    const jitter = Math.random() * 1000;
+    const delay = Math.min(wsReconnectDelay + jitter, 30000);
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      connectWebSocket();
+    }, delay);
+    wsReconnectDelay = Math.min(wsReconnectDelay * 2, 30000);
+  }
+
   function connectWebSocket() {
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
     const wsUrl = `${protocol}//${location.host}/ws`;
@@ -301,13 +434,14 @@ document.addEventListener('DOMContentLoaded', () => {
     ws = new WebSocket(wsUrl);
 
     ws.onopen = () => {
-      connText.textContent = 'ON';
+      if (connText) connText.textContent = 'ON';
       connStatus.querySelector('.dot').style.backgroundColor = 'var(--neon-green)';
       connStatus.querySelector('.dot').style.boxShadow = '0 0 8px var(--neon-green)';
       if (reconnectTimer) {
-        clearInterval(reconnectTimer);
+        clearTimeout(reconnectTimer);
         reconnectTimer = null;
       }
+      wsReconnectDelay = 1000; // conexión ok: el próximo corte reintenta rápido
       if (isHandsFree) {
         startSilentAudioStreaming();
       }
@@ -323,14 +457,10 @@ document.addEventListener('DOMContentLoaded', () => {
     };
 
     ws.onclose = () => {
-      connText.textContent = 'OFF';
+      if (connText) connText.textContent = 'OFF';
       connStatus.querySelector('.dot').style.backgroundColor = 'var(--neon-red)';
       connStatus.querySelector('.dot').style.boxShadow = '0 0 8px var(--neon-red)';
-      if (reconnectTimer) {
-        clearInterval(reconnectTimer);
-        reconnectTimer = null;
-      }
-      reconnectTimer = setInterval(connectWebSocket, 2000);
+      scheduleWsReconnect();
     };
 
     ws.onerror = () => ws.close();
@@ -352,11 +482,30 @@ document.addEventListener('DOMContentLoaded', () => {
     switch (msg.type) {
       case 'set_stage':
         if (typeof setInactivityStage === 'function') {
-          setInactivityStage(msg.stage, true);
+          setInactivityStage(msg.stage, true, msg.drink || null);
         }
         break;
 
       case 'init_snapshot':
+        // Si el servidor publicó assets más nuevos que los que cargó esta
+        // pestaña, recargar una sola vez (anti caché vieja del J2).
+        // FIX 2026-09-23 (bug pava del mate).
+        if (msg.data.asset_version && msg.data.asset_version !== APP_ASSET_VERSION) {
+          try {
+            const rk = 'titan_asset_reload_' + msg.data.asset_version;
+            if (!sessionStorage.getItem(rk)) {
+              sessionStorage.setItem(rk, '1');
+              // FIX 2026-09-24: location.reload() en el WebView viejo del J2
+              // suele servir la página cacheada (la animación de bebidas nunca
+              // arrancaba porque el chopp no existía en la página vieja).
+              // Navegar con query-string fuerza descarga fresca del index.
+              const bust = 'assetv=' + encodeURIComponent(msg.data.asset_version);
+              const sep = location.search ? '&' : '?';
+              location.href = location.pathname + location.search + sep + bust;
+              return;
+            }
+          } catch (e) { /* sessionStorage no disponible: se sigue igual */ }
+        }
         const initMode = msg.data.current_mode || (msg.data.is_rebel_mode ? 'rebel' : 'normal');
         updateActiveMode(initMode);
         if (msg.data.last_speaker) {
@@ -371,7 +520,7 @@ document.addEventListener('DOMContentLoaded', () => {
         updateState(msg.data.state, msg.data.detail);
         if (msg.data.inactivity_stage && msg.data.inactivity_stage !== 'idle') {
           if (typeof setInactivityStage === 'function') {
-            setInactivityStage(msg.data.inactivity_stage, false);
+            setInactivityStage(msg.data.inactivity_stage, false, msg.data.current_drink || null);
           }
           if (msg.data.idle_seconds !== undefined) {
             idleSeconds = msg.data.idle_seconds;
@@ -400,8 +549,8 @@ document.addEventListener('DOMContentLoaded', () => {
       case 'tool_execution':
         appendHistoryItem(msg);
         if (msg.type === 'assistant_speech') {
-          // Solo actualizar texto en pantalla — la boca se mueve con speech_playing
-          updateFaceSpeech(msg.text);
+          // 2026-09-17: no se muestra en pantalla lo que dice Titán
+          ocultarBurbuja();
         }
         break;
 
@@ -479,6 +628,16 @@ document.addEventListener('DOMContentLoaded', () => {
         updateSpeakerBadge(msg.speaker, msg.pitch);
         break;
 
+      case 'speaker_identity':
+        updateIdentityBadge(msg.identity, msg.score, msg.display);
+        lastSpeakerIdentity = msg.identity || null;
+        refreshPolleraFace();
+        break;
+
+      case 'face_expression':
+        setPolleraTransient(msg.expression, msg.ttl);
+        break;
+
       case 'hands_free_changed':
         setHandsFree(!!msg.enabled, false);
         break;
@@ -540,7 +699,7 @@ document.addEventListener('DOMContentLoaded', () => {
   function playAudioBase64(b64Data, text) {
     if (!b64Data) return;
     if (isBrowserAudioMuted) {
-      if (text) updateFaceSpeech(text);
+      ocultarBurbuja(); // 2026-09-17: ni siquiera muteado se muestra lo dicho
       return;
     }
     audioQueue.push({ b64: b64Data, text: text });
@@ -570,7 +729,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
       currentAudioEl.onplay = () => {
         updateState('SPEAKING', 'Hablando...');
-        if (item.text) updateFaceSpeech(item.text);
+        ocultarBurbuja(); // 2026-09-17: la pantalla no muestra lo que dice
       };
 
       currentAudioEl.onended = () => {
@@ -726,7 +885,7 @@ document.addEventListener('DOMContentLoaded', () => {
       "¡No me toqués que no te conozco!",
       "¡Dejá de tocar la pantalla, tarado!"
     ];
-    updateFaceSpeech(rebelShouts[Math.floor(Math.random() * rebelShouts.length)]);
+    ocultarBurbuja(); // 2026-09-17: la pantalla no muestra lo dicho (grito rebelde)
   }
 
   function triggerFriendTap() {
@@ -753,7 +912,7 @@ document.addEventListener('DOMContentLoaded', () => {
       "Todo tranqui por acá, ¿en qué te doy una mano?",
       "¡Siempre listo para salir a ganar!"
     ];
-    updateFaceSpeech(friendPhrases[Math.floor(Math.random() * friendPhrases.length)]);
+    ocultarBurbuja(); // 2026-09-17: la pantalla no muestra lo dicho (frase compinche)
   }
 
   function updateState(state, detail) {
@@ -783,6 +942,11 @@ document.addEventListener('DOMContentLoaded', () => {
     orbIcon.textContent = s.icon;
     if (detail) statusDetail.textContent = detail;
 
+    // Limpiar la escucha reactiva al cambiar de estado (2026-09-17): la
+    // cara vuelve a control del CSS o del nuevo estado
+    if (caraEl) { caraEl.style.transform = ''; caraEl.style.filter = ''; }
+    escuchaSuave = 0; escuchaNod = 0; escuchaProxNod = 0;
+
     // Ajustar expresión facial completa (ojos, cejas, boca y gestos)
     if (isRebelMode) {
       if (state === 'LISTENING') {
@@ -807,12 +971,13 @@ document.addEventListener('DOMContentLoaded', () => {
         if (eyeRight) eyeRight.style.transform = 'scaleY(0.85)';
         if (mouthMesh) mouthMesh.style.transform = 'none';
       } else {
-        // IDLE: Mueca de desprecio y cejas enojadas
-        if (eyebrowLeft) eyebrowLeft.style.transform = 'translateY(8px) rotate(20deg)';
-        if (eyebrowRight) eyebrowRight.style.transform = 'translateY(8px) rotate(-20deg)';
-        if (eyeLeft) eyeLeft.style.transform = 'scaleY(0.72)';
-        if (eyeRight) eyeRight.style.transform = 'scaleY(0.72)';
-        if (mouthMesh) mouthMesh.style.transform = 'rotate(-5deg) translateY(2px)';
+        // IDLE: Enojo de verdad (2026-09-17): cejas clavadas en ángulo y bajas,
+        // ojos inclinados hacia la nariz y entrecerrados; el ceño de la boca lo pone el CSS
+        if (eyebrowLeft) eyebrowLeft.style.transform = 'translateY(13px) rotate(22deg)';
+        if (eyebrowRight) eyebrowRight.style.transform = 'translateY(13px) rotate(-22deg)';
+        if (eyeLeft) eyeLeft.style.transform = 'rotate(9deg) scaleY(0.8)';
+        if (eyeRight) eyeRight.style.transform = 'rotate(-9deg) scaleY(0.8)';
+        if (mouthMesh) mouthMesh.style.transform = 'none';
       }
     } else {
       // Modo normal amigo de fierro: expresiones amables y vivas
@@ -835,6 +1000,22 @@ document.addEventListener('DOMContentLoaded', () => {
         if (eyeLeft) eyeLeft.style.transform = 'none';
         if (eyeRight) eyeRight.style.transform = 'none';
         if (mouthMesh) mouthMesh.style.transform = 'none';
+      } else if (state === 'EXECUTING_TOOL') {
+        // Gesto de concentración (2026-09-17): cejas hacia adentro, ojos
+        // enfocados, boca contenida; el vaivén lo pone el CSS (ejecutarFoco)
+        if (eyebrowLeft) eyebrowLeft.style.transform = 'translateY(9px) rotate(15deg)';
+        if (eyebrowRight) eyebrowRight.style.transform = 'translateY(9px) rotate(-15deg)';
+        if (eyeLeft) eyeLeft.style.transform = 'scaleY(0.72)';
+        if (eyeRight) eyeRight.style.transform = 'scaleY(0.72)';
+        if (mouthMesh) mouthMesh.style.transform = 'translateY(2px) scaleY(0.45)';
+      } else if (state === 'ERROR') {
+        // Cara de "ups" (2026-09-17): cejas de preocupación, mirada gacha,
+        // mueca de culpa; el wince de entrada y el vaivén los pone el CSS
+        if (eyebrowLeft) eyebrowLeft.style.transform = 'translateY(-6px) rotate(-20deg)';
+        if (eyebrowRight) eyebrowRight.style.transform = 'translateY(-6px) rotate(20deg)';
+        if (eyeLeft) eyeLeft.style.transform = 'translateY(7px) scaleY(0.8)';
+        if (eyeRight) eyeRight.style.transform = 'translateY(7px) scaleY(0.8)';
+        if (mouthMesh) mouthMesh.style.transform = 'translateY(3px) rotate(-10deg) scaleX(0.7)';
       } else {
         // IDLE: Limpiar transforms en línea para que corran las animaciones orgánicas de CSS y miradas
         if (currentInactivityStage === 'idle') {
@@ -858,13 +1039,22 @@ document.addEventListener('DOMContentLoaded', () => {
 
     if (state === 'LISTENING' && detail && (detail.includes('seguí') || detail.includes('Te escucho'))) {
       if (faceWrapper) faceWrapper.classList.add('conversing');
-      if (faceSpeechText) faceSpeechText.textContent = 'Te escucho... (seguí hablando o decí "chau")';
+      updateFaceSpeech('Te escucho... (seguí hablando o decí "chau")');
     } else {
       if (faceWrapper) faceWrapper.classList.remove('conversing');
     }
   }
 
+  // 2026-09-17: la pantalla no muestra lo que dice Titán. La burbuja queda
+  // solo para avisos de estado (micrófono, "te escucho"...); lo hablado no
+  // se escribe en pantalla.
+  function ocultarBurbuja() {
+    if (faceSpeechText) faceSpeechText.textContent = '';
+    if (faceSpeechBubble) faceSpeechBubble.classList.add('bubble-oculta');
+  }
+
   function updateFaceSpeech(text) {
+    if (faceSpeechBubble) faceSpeechBubble.classList.remove('bubble-oculta');
     if (faceSpeechText) {
       faceSpeechText.textContent = text;
     }
@@ -906,10 +1096,181 @@ document.addEventListener('DOMContentLoaded', () => {
     if (caraEl) caraEl.style.transform = '';
   }
 
-  function setInactivityStage(stage, manual = false) {
+  // --- Ciclo de la pava del mate por JS (FIX 2026-09-23, bug pava del mate) ---
+  // Las animaciones CSS sobre <g> SVG no corren en el WebView viejo del J2
+  // (Fully Kiosk): la pava quedaba fija en pantalla. Por eso la coreografía
+  // de la pava se maneja con estilos inline + timers, que andan en cualquier
+  // navegador. Ciclo de 10.5s, en fase con las animaciones CSS de la cara
+  // (eyeMateCycle/mouthSequenceSip): la pava ceba y se va mientras Titán toma.
+  let matePavaInterval = null;
+  let matePavaTimeouts = [];
+
+  function stopMatePavaCycle() {
+    if (matePavaInterval) { clearInterval(matePavaInterval); matePavaInterval = null; }
+    matePavaTimeouts.forEach(clearTimeout);
+    matePavaTimeouts = [];
+    const kettle = document.getElementById('kettleLeftGroup');
+    const stream = document.getElementById('waterStreamGroup');
+    if (kettle) { kettle.style.animation = ''; kettle.style.opacity = ''; kettle.style.transition = ''; }
+    if (stream) { stream.style.animation = ''; stream.style.opacity = ''; stream.style.transition = ''; }
+  }
+
+  function startMatePavaCycle() {
+    stopMatePavaCycle();
+    const kettle = document.getElementById('kettleLeftGroup');
+    const stream = document.getElementById('waterStreamGroup');
+    if (!kettle) return;
+    kettle.style.animation = 'none';
+    kettle.style.transition = 'opacity 0.6s ease';
+    if (stream) {
+      stream.style.animation = 'none';
+      stream.style.transition = 'opacity 0.4s ease';
+    }
+    const later = (fn, ms) => { matePavaTimeouts.push(setTimeout(fn, ms)); };
+    const pour = () => {
+      matePavaTimeouts = [];
+      kettle.style.opacity = '0';
+      if (stream) stream.style.opacity = '0';
+      later(() => { kettle.style.opacity = '1'; }, 1400);              // la pava entra
+      later(() => { if (stream) stream.style.opacity = '1'; }, 3100);  // ceba
+      later(() => { if (stream) stream.style.opacity = '0'; }, 5000);  // corta el chorro
+      later(() => { kettle.style.opacity = '0'; }, 6200);              // la pava se va, Titán toma
+    };
+    pour();
+    matePavaInterval = setInterval(pour, 10500);
+  }
+
+  // --- Ciclo de bebidas: el viajero (vaso de botella cortada) — FIX 2026-09-23 (v2) ---
+  // Arte y coreografía de Exequiel (muestra del fernet): el viajero descansa al costado,
+  // sube, se inclina a la boca (trago) y vuelve. Loop de 12s.
+  // El WebView viejo del J2 no corre animaciones CSS sobre <g> SVG, así que el vaso /
+  // la botella se animan por JS: en cada frame se interpola la coreografía y se setea
+  // el atributo transform (translate + rotate sobre un pivote) y opacity. La cara
+  // (ojos achinados, boca en O, sonrisa de satisfacción) va en CSS sobre el HTML.
+  const VIAJERO_LOOP_MS = 12000;
+  // La rotación pivota sobre el borde del vaso (143,196): el borde queda fijo ante
+  // la rotación y el translate lo lleva a la boca (~100,200), así el trago apoya el
+  // borde en los labios en vez de besar con la base. FIX 2026-09-23 (alineación).
+  // FIX 2026-09-24 (pedido de Exequiel): el trago va al principio del ciclo (~1.5s de activado).
+  const VIAJERO_KEYS = [
+    { t: 0.00, x: 0,   y: 0,   r: 0,   o: 0.95 },  // reposo al costado
+    { t: 0.04, x: 0,   y: 0,   r: 0,   o: 0.95 },
+    { t: 0.10, x: -25, y: -18, r: -10, o: 1.0 },   // levanta el viajero
+    { t: 0.14, x: -43, y: 4,   r: -30, o: 1.0 },   // el borde llega a la boca, trago inclinado
+    { t: 0.30, x: -43, y: 4,   r: -30, o: 1.0 },   // toma
+    { t: 0.38, x: -15, y: -6,  r: -8,  o: 1.0 },   // baja
+    { t: 0.44, x: 0,   y: 0,   r: 0,   o: 0.95 },  // de vuelta al costado
+    { t: 1.00, x: 0,   y: 0,   r: 0,   o: 0.95 },
+  ];
+  // Chopp cervecero: la rotación pivota sobre el borde del vaso (142,200) y el
+  // translate lo lleva a la boca (~100,200). ARTE DE EXEQUIEL 2026-09-24
+  // (cerveza.html); la animación CSS original no corría en el WebView viejo del
+  // J2 (ni alineaba el borde con la boca), así que va por JS como el resto.
+  const CHOPP_KEYS = [
+    { t: 0.00, x: 0,   y: 0,   r: 0,   o: 0.95 },  // reposo al costado
+    { t: 0.04, x: 0,   y: 0,   r: 0,   o: 0.95 },
+    { t: 0.10, x: -24, y: -16, r: -10, o: 1.0 },   // levanta el chopp
+    { t: 0.14, x: -42, y: 0,   r: -32, o: 1.0 },   // el borde llega a la boca
+    { t: 0.20, x: -42, y: 0,   r: -36, o: 1.0 },   // glug leve
+    { t: 0.30, x: -42, y: 0,   r: -32, o: 1.0 },   // toma
+    { t: 0.38, x: -14, y: -6,  r: -8,  o: 1.0 },   // baja
+    { t: 0.44, x: 0,   y: 0,   r: 0,   o: 0.95 },  // de vuelta al costado
+    { t: 1.00, x: 0,   y: 0,   r: 0,   o: 0.95 },
+  ];
+  // Tetra arremangado de vino con coca: la rotación pivota sobre el labio de
+  // aluminio (146,210) y el translate lo lleva a la boca (~100,200).
+  // Arte de Exequiel 2026-09-23; la animación CSS original no corría en el WebView
+  // viejo del J2 (ni alineaba el borde con la boca), así que va por JS como el resto.
+  const TETRA_KEYS = [
+    { t: 0.00, x: 0,   y: 0,   r: 0,   o: 0.95 },  // reposo al costado
+    { t: 0.04, x: 0,   y: 0,   r: 0,   o: 0.95 },
+    { t: 0.10, x: -28, y: -20, r: -12, o: 1.0 },   // levanta el tetra
+    { t: 0.14, x: -45, y: -11, r: -32, o: 1.0 },   // el labio llega a la boca
+    { t: 0.20, x: -45, y: -11, r: -37, o: 1.0 },   // glug leve
+    { t: 0.30, x: -45, y: -11, r: -32, o: 1.0 },   // toma
+    { t: 0.38, x: -15, y: -8,  r: -8,  o: 1.0 },   // baja
+    { t: 0.44, x: 0,   y: 0,   r: 0,   o: 0.95 },  // de vuelta al costado
+    { t: 1.00, x: 0,   y: 0,   r: 0,   o: 0.95 },
+  ];
+  // Qué se muestra por bebida: fernet en el viajero, birra en chopp,
+  // vino con coca en el tetra arremangado (arte de Exequiel).
+  const BEBIDAS_RIGS = {
+    fernet: { groupId: 'viajeroGroup', keys: VIAJERO_KEYS, pivot: [143, 196],
+              liquid: 'url(#fernetLiquid)', foam: 'url(#foamFernet)' },
+    birra:  { groupId: 'choppGroup', keys: CHOPP_KEYS, pivot: [142, 200] },
+    vino:   { groupId: 'tetraVasoGroup', keys: TETRA_KEYS, pivot: [146, 210] },
+  };
+  let bebidasFrameTimer = null;
+
+  function randomDrink() {
+    const ds = Object.keys(BEBIDAS_RIGS);
+    return ds[Math.floor(Math.random() * ds.length)];
+  }
+
+  function bebidasEase(u) {
+    return u < 0.5 ? 4 * u * u * u : 1 - Math.pow(-2 * u + 2, 3) / 2;
+  }
+
+  function bebidasPose(keys, p) {
+    let a = keys[0], b = keys[keys.length - 1];
+    for (let i = 0; i < keys.length - 1; i++) {
+      if (p >= keys[i].t && p <= keys[i + 1].t) {
+        a = keys[i]; b = keys[i + 1]; break;
+      }
+    }
+    const span = (b.t - a.t) || 1;
+    const u = bebidasEase(Math.min(1, Math.max(0, (p - a.t) / span)));
+    return {
+      x: a.x + (b.x - a.x) * u,
+      y: a.y + (b.y - a.y) * u,
+      r: a.r + (b.r - a.r) * u,
+      o: a.o + (b.o - a.o) * u,
+    };
+  }
+
+  function stopBebidasCycle() {
+    if (bebidasFrameTimer) { clearInterval(bebidasFrameTimer); bebidasFrameTimer = null; }
+    for (const id of ['viajeroGroup', 'choppGroup', 'tetraVasoGroup']) {
+      const g = document.getElementById(id);
+      if (g) { g.removeAttribute('transform'); g.setAttribute('opacity', '0'); }
+    }
+  }
+
+  function startBebidasCycle(drink) {
+    stopBebidasCycle();
+    const rig = BEBIDAS_RIGS[drink] || BEBIDAS_RIGS[randomDrink()];
+    const g = document.getElementById(rig.groupId);
+    if (!g) return;
+    if (rig.liquid) {
+      const liq = document.getElementById('viajeroLiquid');
+      const foam = document.getElementById('viajeroFoam');
+      if (liq) liq.setAttribute('fill', rig.liquid);
+      if (foam) foam.setAttribute('fill', rig.foam);
+    }
+    const bubbles = Array.prototype.slice.call(g.querySelectorAll('.fizz-bubble'));
+    const t0 = Date.now();
+    const frame = () => {
+      const p = ((Date.now() - t0) % VIAJERO_LOOP_MS) / VIAJERO_LOOP_MS;
+      const pose = bebidasPose(rig.keys, p);
+      g.setAttribute('transform',
+        'translate(' + pose.x.toFixed(1) + ' ' + pose.y.toFixed(1) + ')' +
+        ' rotate(' + pose.r.toFixed(1) + ' ' + rig.pivot[0] + ' ' + rig.pivot[1] + ')');
+      g.setAttribute('opacity', pose.o.toFixed(2));
+      // Efervescencia: pulso de opacidad con fase por burbuja (un ciclo cada 2.5s)
+      for (const b of bubbles) {
+        const ph = parseFloat(b.getAttribute('data-phase') || '0');
+        const s = Math.sin(2 * Math.PI * (p * (VIAJERO_LOOP_MS / 2500) + ph));
+        b.setAttribute('opacity', (0.15 + 0.75 * Math.max(0, s)).toFixed(2));
+      }
+    };
+    frame();
+    bebidasFrameTimer = setInterval(frame, 50);
+  }
+
+  function setInactivityStage(stage, manual = false, drink = null) {
     if (isWakeStartleActive && stage !== 'wake') return;
 
-    const validStages = ['idle', 'mate', 'drowsy', 'sleeping', 'wake'];
+    const validStages = ['idle', 'mate', 'bebidas', 'drowsy', 'sleeping', 'wake'];
     const s = validStages.includes(stage) ? stage : 'idle';
 
     if (s === 'wake') {
@@ -917,10 +1278,13 @@ document.addEventListener('DOMContentLoaded', () => {
       return;
     }
 
-    currentInactivityStage = s;
-    body.classList.remove('stage-mate', 'stage-drowsy', 'stage-sleeping', 'stage-wake-startle');
+    if (s !== 'mate') stopMatePavaCycle();
+    if (s !== 'bebidas') stopBebidasCycle();
 
-    if (s === 'mate' || s === 'drowsy' || s === 'sleeping') {
+    currentInactivityStage = s;
+    body.classList.remove('stage-mate', 'stage-bebidas', 'stage-drowsy', 'stage-sleeping', 'stage-wake-startle');
+
+    if (s === 'mate' || s === 'bebidas' || s === 'drowsy' || s === 'sleeping') {
       if (typeof switchView === 'function' && !body.classList.contains('active-view-face')) {
         switchView('face');
       }
@@ -930,6 +1294,14 @@ document.addEventListener('DOMContentLoaded', () => {
       if (manual) idleSeconds = 900;
       clearFaceTransformsForStages();
       body.classList.add('stage-mate');
+      startMatePavaCycle();
+    } else if (s === 'bebidas') {
+      // Modo bebidas bien de barrio (finde a la noche o por voz).
+      // FIX 2026-09-23.
+      if (manual) idleSeconds = 900;
+      clearFaceTransformsForStages();
+      body.classList.add('stage-bebidas');
+      startBebidasCycle(drink || randomDrink());
     } else if (s === 'drowsy') {
       if (manual) idleSeconds = 1800;
       clearFaceTransformsForStages();
@@ -947,12 +1319,34 @@ document.addEventListener('DOMContentLoaded', () => {
 
   function wakeUpWithStartle() {
     if (isWakeStartleActive) return;
-    const wasResting = (currentInactivityStage !== 'idle');
+    stopMatePavaCycle();
+    stopBebidasCycle();
+    const wokeFrom = currentInactivityStage;
+    const wasResting = (wokeFrom !== 'idle');
     isWakeStartleActive = true;
     idleSeconds = 0;
     currentInactivityStage = 'idle';
 
-    body.classList.remove('stage-mate', 'stage-drowsy', 'stage-sleeping');
+    if (wokeFrom === 'sleeping') {
+      // Despertar suave desde el sueño profundo: la burbuja explota y el
+      // gorro se le sale (1.1s, clase stage-waking), sin sobresalto.
+      // El sobresalto queda solo para el estado cansado (drowsy).
+      body.classList.remove('stage-mate', 'stage-bebidas', 'stage-drowsy');
+      clearFaceTransformsForStages();
+      body.classList.add('stage-waking');
+      triggerWakePulse();
+
+      setTimeout(() => {
+        body.classList.remove('stage-sleeping', 'stage-waking');
+        isWakeStartleActive = false;
+        clearFaceTransformsForStages();
+        scheduleNextGlance();
+        scheduleNextBlink();
+      }, 1150);
+      return;
+    }
+
+    body.classList.remove('stage-mate', 'stage-bebidas', 'stage-drowsy', 'stage-sleeping');
     clearFaceTransformsForStages();
 
     if (wasResting) {
@@ -982,6 +1376,54 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
+  // Escala la cara al tamaño de SU CONTENEDOR (2026-09-17, v3): la cara ocupa
+  // el 80% del lado corto en pantallas chicas (celulares) y el 70% en
+  // pantallas grandes -> presencia consistente. En el J2 queda un poco más
+  // grande que los 200x250 fijos de antes, sin pasarse;
+  // en monitor/tablet crece sin desbordar. Se mide el contenedor real
+  // (no window) para que barras de navegación u otro chrome no falseen
+  // la cuenta. Se usa `zoom` (no transform): el flex lo centra siempre y
+  // los WebView viejos lo renderizan sin glitches. El envoltorio .face-scale
+  // existe para no pisar las animaciones de transform de #cara.
+  function fitFaceToViewport() {
+    const scaler = document.getElementById('faceScale');
+    const stage = document.getElementById('faceTriggerArea');
+    if (!scaler || !stage) return;
+    const r = stage.getBoundingClientRect();
+    if (r.width < 10 || r.height < 10) return;
+    // En pantallas chicas (celulares) un poco más de presencia (0.80);
+    // en pantallas grandes 0.70, que ya quedó bien (2026-09-17 v3).
+    const corto = Math.min(r.width, r.height);
+    const factor = corto < 500 ? 0.80 : 0.70;
+    const scale = (corto * factor) / 250;
+    scaler.style.transform = '';
+    scaler.style.zoom = String(scale);
+  }
+
+  // Diagnóstico de escala: abrir el HUD con ?diag=1 muestra las medidas
+  // reales (viewport, contenedor, zoom aplicado) para depurar pantallas.
+  try {
+    if (new URLSearchParams(location.search).get('diag') === '1') {
+      const showDiag = () => {
+        const stage = document.getElementById('faceTriggerArea');
+        const scaler = document.getElementById('faceScale');
+        const r = stage ? stage.getBoundingClientRect() : { width: 0, height: 0 };
+        let d = document.getElementById('diagEscala');
+        if (!d) {
+          d = document.createElement('div');
+          d.id = 'diagEscala';
+          d.style.cssText = 'position:fixed;left:8px;top:8px;z-index:999999;background:rgba(0,0,0,.92);color:#0f0;font:12px/1.6 monospace;padding:8px 10px;border:1px solid #0f0;white-space:pre;border-radius:6px;';
+          document.body.appendChild(d);
+        }
+        d.textContent = 'win ' + window.innerWidth + 'x' + window.innerHeight +
+          '\ncont ' + Math.round(r.width) + 'x' + Math.round(r.height) +
+          '\nzoom ' + (scaler ? scaler.style.zoom || '(defecto)' : '?');
+      };
+      setInterval(showDiag, 1000);
+      showDiag();
+    }
+  } catch (e) { /* diagnóstico opcional */ }
+
   function initInactivityTracker() {
     if (idleInterval) clearInterval(idleInterval);
     idleInterval = setInterval(() => {
@@ -997,8 +1439,11 @@ document.addEventListener('DOMContentLoaded', () => {
             setInactivityStage('drowsy');
           }
         } else if (idleSeconds >= 900) {
-          if (currentInactivityStage !== 'mate') {
-            setInactivityStage('mate');
+          // Noche de finde: en vez del mate, Titán se toma algo bien de barrio.
+          // FIX 2026-09-23 (modo bebidas).
+          const firstStage = isWeekendNight() ? 'bebidas' : 'mate';
+          if (currentInactivityStage !== 'mate' && currentInactivityStage !== 'bebidas') {
+            setInactivityStage(firstStage, false, firstStage === 'bebidas' ? randomDrink() : null);
           }
         }
       }
@@ -1017,9 +1462,14 @@ document.addEventListener('DOMContentLoaded', () => {
   // ============================================================
 
   // 1. Parpadeo orgánico: simple, doble parpadeo y guiños compinches
+  // 2026-09-17: se guarda el timer y se limpia antes de reagendar. Antes cada
+  // despertar (stage-waking / wake-startle) arrancaba una cadena nueva sin
+  // frenar la anterior, y con cada ciclo los parpadeos se aceleraban.
+  let idleBlinkTimer = null;
   function scheduleNextBlink() {
+    clearTimeout(idleBlinkTimer);
     const delay = Math.random() * 3200 + 2000; // Entre 2 y 5.2 segundos
-    setTimeout(() => {
+    idleBlinkTimer = setTimeout(() => {
       if (currentInactivityStage !== 'idle' || isWakeStartleActive) {
         scheduleNextBlink();
         return;
@@ -1093,14 +1543,30 @@ document.addEventListener('DOMContentLoaded', () => {
     ];
 
     const chosen = options[Math.floor(Math.random() * options.length)];
-    applyGlance(chosen.x, chosen.y, chosen.browL, chosen.browR, chosen.headRot);
+
+    // Curiosidad ocasional (2026-09-17): ladea la cabeza y levanta una ceja,
+    // como si notara algo. Va por la misma cadena de miradas (sin timers nuevos).
+    const isCurious = !isRebelMode && Math.random() < 0.15;
+    const final = isCurious
+      ? { x: 2, y: 0, browL: -7, browR: 0, headRot: 3.5, duration: 2000 }
+      : chosen;
+    applyGlance(final.x, final.y, final.browL, final.browR, final.headRot);
+    if (isCurious) {
+      // idleOrganico pisa el transform en línea: se pausa la animación para que
+      // se vea la ladeada; resetGlance la restaura al terminar.
+      const caraEl = document.getElementById('cara');
+      if (caraEl) {
+        caraEl.style.animation = 'none';
+        caraEl.style.transform = `rotate(${final.headRot}deg)`;
+      }
+    }
 
     setTimeout(() => {
       if (currentState === 'IDLE' && !mouseTrackingActive) {
         resetGlance();
       }
       scheduleNextGlance();
-    }, chosen.duration);
+    }, final.duration);
   }
 
   function applyGlance(x, y, browL = 0, browR = 0, headRot = 0) {
@@ -1130,6 +1596,8 @@ document.addEventListener('DOMContentLoaded', () => {
     if (eyebrowRight) eyebrowRight.style.transform = '';
     const caraEl = document.getElementById('cara');
     if (caraEl) caraEl.style.transform = '';
+    // 2026-09-17: restaura la animación de respiro tras la curiosidad
+    if (caraEl) caraEl.style.animation = '';
   }
 
   function scheduleNextGlance() {
@@ -1192,14 +1660,44 @@ document.addEventListener('DOMContentLoaded', () => {
       if (eyebrowLeft) eyebrowLeft.style.transform = `translateY(${11 - bounce}px) rotate(${22 + bounce * 0.4}deg)`;
       if (eyebrowRight) eyebrowRight.style.transform = `translateY(${11 - bounce}px) rotate(${-22 - bounce * 0.4}deg)`;
     }
+
+    // 3. Escucha reactiva (2026-09-17): en LISTENING (modo normal) la cara
+    // se inclina hacia la voz del usuario, los ojos se abren un toque, el
+    // halo se enciende con el nivel del mic y cada tanto asiente suave
+    // ("te sigo"). Si no llegan niveles, queda la pose atenta de siempre.
+    if (!isRebelMode && currentState === 'LISTENING') {
+      escuchaSuave += (level - escuchaSuave) * 0.25;
+      const ahora = performance.now();
+      if (ahora >= escuchaProxNod) {
+        escuchaNod = 1;
+        escuchaProxNod = ahora + 2600 + Math.random() * 1400;
+      }
+      escuchaNod += (0 - escuchaNod) * 0.08;
+      const nod = Math.sin(Math.min(1, escuchaNod) * Math.PI) * 8;
+      if (caraEl) {
+        const acercar = 1 + escuchaSuave * 0.09;
+        const inclinar = Math.sin(ahora / 1300) * 1 + (escuchaSuave * 2);
+        caraEl.style.transform = `scale(${acercar.toFixed(3)}) rotate(${inclinar.toFixed(2)}deg) translateY(${(nod * 0.7).toFixed(1)}px)`;
+        caraEl.style.filter = `drop-shadow(0 0 ${Math.round(14 + escuchaSuave * 14)}px rgba(0, 240, 255, ${(0.4 + escuchaSuave * 0.35).toFixed(2)}))`;
+      }
+      const abrir = (1 + escuchaSuave * 0.12).toFixed(3);
+      if (eyeLeft) eyeLeft.style.transform = `scaleY(${abrir})`;
+      if (eyeRight) eyeRight.style.transform = `scaleY(${abrir})`;
+      if (eyebrowLeft) eyebrowLeft.style.transform = `translateY(${(-6 - nod * 0.8).toFixed(1)}px) rotate(-4deg)`;
+      if (eyebrowRight) eyebrowRight.style.transform = `translateY(${(-6 - nod * 0.8).toFixed(1)}px) rotate(4deg)`;
+    }
   }
 
   // ============================================================
   // MOTOR DE VISEMAS Y ARTICULACIÓN FONÉTICA (SINCRONIZACIÓN POR AUDIO REAL)
   // ============================================================
   const ALL_VISEMES = ['viseme-open', 'viseme-round', 'viseme-closed', 'viseme-dental', 'viseme-rest'];
+  let escuchaSuave = 0;  // nivel del mic suavizado para la escucha reactiva (2026-09-17)
+  let escuchaNod = 0;    // impulso de asentimiento ("te sigo")
+  let escuchaProxNod = 0;
   let lastVisemeChangeTime = 0;
   let currentVisemeIdx = 0;
+  let hablaSuave = 0; // nivel de voz suavizado para mover cabeza y cejas (2026-09-17)
 
   function setMouthViseme(visemeClass) {
     if (!mouthMesh) return;
@@ -1218,7 +1716,7 @@ document.addEventListener('DOMContentLoaded', () => {
       }
       mouthMesh.classList.add('viseme-rest');
       if (isRebelMode && currentState === 'IDLE') {
-        mouthMesh.style.transform = 'rotate(-5deg) translateY(2px)';
+        mouthMesh.style.transform = 'none';
       } else {
         mouthMesh.style.transform = 'none';
       }
@@ -1229,6 +1727,11 @@ document.addEventListener('DOMContentLoaded', () => {
     // 1. Si no está hablando o el volumen es silencio / pausa (< 0.05):
     // La boca se detiene y se cierra de inmediato en reposo natural
     if (currentState !== 'SPEAKING' || level <= 0.05) {
+      // La cabeza y las cejas vuelven a control del CSS (2026-09-17)
+      hablaSuave = 0;
+      if (caraEl) caraEl.style.transform = '';
+      if (eyebrowLeft) eyebrowLeft.style.transform = '';
+      if (eyebrowRight) eyebrowRight.style.transform = '';
       if (mouthMesh) {
         ALL_VISEMES.forEach(cls => mouthMesh.classList.remove(cls));
         if (currentInactivityStage !== 'idle') {
@@ -1242,7 +1745,12 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     // 2. Modulación activa de fonemas y apertura según la velocidad y volumen de la voz
-    if (mouthMesh) {
+    // FIX 2026-09-24: en modo mate/bebidas la boca la maneja la coreografía CSS
+    // de la etapa (animation !important); si el lip-sync le cambia visemes y
+    // transform encima, el WebView viejo del J2 parpadea. La cabeza y las cejas
+    // (sección 3) siguen con la voz igual.
+    const bocaConCoreografia = (currentInactivityStage === 'bebidas' || currentInactivityStage === 'mate');
+    if (mouthMesh && !bocaConCoreografia) {
       const now = performance.now();
       // Cadencia natural de articulación fonética humana (~90ms entre sílabas)
       if (now - lastVisemeChangeTime > 90) {
@@ -1269,7 +1777,23 @@ document.addEventListener('DOMContentLoaded', () => {
       mouthMesh.style.transform = `scaleY(${scale.toFixed(2)})`;
     }
 
-    // 3. Reactividad de cejas y orbe con el volumen del habla
+    // 3. Cabeza y cejas siguen la voz (2026-09-17): reemplaza los metrónomos
+    // fijos. La cabeza cabecea leve en las sílabas acentuadas (picos sobre el
+    // nivel suavizado) y las cejas se levantan con la energía del habla.
+    hablaSuave += (level - hablaSuave) * 0.3;
+    if (caraEl) {
+      const acento = Math.max(0, level - hablaSuave);
+      const cabeceo = Math.min(6, acento * 20);
+      const balanceo = Math.sin(performance.now() / 1100) * 1.2;
+      caraEl.style.transform = `translateY(${cabeceo.toFixed(1)}px) rotate(${balanceo.toFixed(2)}deg)`;
+    }
+    if (!isRebelMode) {
+      const subir = Math.min(5, hablaSuave * 9);
+      if (eyebrowLeft) eyebrowLeft.style.transform = `translateY(${(-subir).toFixed(1)}px) rotate(${(-2 - subir * 0.4).toFixed(1)}deg)`;
+      if (eyebrowRight) eyebrowRight.style.transform = `translateY(${(-subir * 0.7).toFixed(1)}px) rotate(${(2 + subir * 0.3).toFixed(1)}deg)`;
+    }
+
+    // 4. Reactividad de cejas y orbe con el volumen del habla
     handleLipSyncAndWaves(level);
   }
 
@@ -1398,11 +1922,20 @@ document.addEventListener('DOMContentLoaded', () => {
       micWs = new WebSocket(`${protocol}//${location.host}/ws/mic`);
       micWs.binaryType = 'arraybuffer';
       micWs.onopen = () => {
+        micReconnectDelay = 1000; // mic conectado: el próximo corte reintenta rápido
         captureMicrophoneStream();
       };
       micWs.onclose = () => {
         micWs = null;
-        if (isHandsFree) setTimeout(startSilentAudioStreaming, 2000);
+        if (isHandsFree) {
+          // Backoff exponencial con jitter (1s -> 30s tope), igual que el WS principal
+          const jitter = Math.random() * 1000;
+          const delay = Math.min(micReconnectDelay + jitter, 30000);
+          micReconnectDelay = Math.min(micReconnectDelay * 2, 30000);
+          setTimeout(() => {
+            if (isHandsFree) startSilentAudioStreaming();
+          }, delay);
+        }
       };
       micWs.onerror = () => {
         if (micWs) micWs.close();
@@ -1794,6 +2327,16 @@ document.addEventListener('DOMContentLoaded', () => {
     return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
   }
 
+  // S-16: escapeHtml no filtra esquemas; un "javascript:..." en una URL
+  // sobrevivía al interpolarlo en href/src. Solo se permiten rutas del
+  // servidor y http(s); lo demás cae a '#'.
+  function safeUrl(url) {
+    const u = String(url || '').trim();
+    if (/^https?:\/\//i.test(u)) return u;
+    if (u.startsWith('/')) return u;
+    return '#';
+  }
+
   function sendWs(data) {
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify(data));
@@ -2130,13 +2673,13 @@ document.addEventListener('DOMContentLoaded', () => {
         <span style="margin-left:auto;color:var(--text-muted);font-size:0.65rem;">${escapeHtml(timeStr)}</span>
       </div>
       <div class="img-preview-box" title="Clic para ver en grande">
-        <img src="${escapeHtml(imgUrl)}" alt="${escapeHtml(promptText)}" loading="lazy">
+        <img src="${safeUrl(imgUrl)}" alt="${escapeHtml(promptText)}" loading="lazy">
       </div>
       <div class="card-prompt">
         <strong>"${escapeHtml(promptText)}"</strong>
       </div>
       <div class="card-actions">
-        <a href="${escapeHtml(imgUrl)}" download="${escapeHtml(filename)}" class="btn-img-action primary" title="Descargar imagen a máxima resolución">
+        <a href="${safeUrl(imgUrl)}" download="${escapeHtml(filename)}" class="btn-img-action primary" title="Descargar imagen a máxima resolución">
           <span>⬇️</span> Descargar
         </a>
         <button type="button" class="btn-img-action btn-lightbox-trigger" title="Ver en pantalla completa">
@@ -2618,9 +3161,24 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
-  // Polling continuo de telemetría dual (PC Principal Windows + Servidor DDR3) cada 2.5s
-  fetchTelemetry();
-  setInterval(fetchTelemetry, 2500);
+  // Polling continuo de telemetría dual (PC Principal Windows + Servidor DDR3) cada 2.5s.
+  // F13: con guard anti-solape (si un fetch tarda >2.5s no se apilan) y
+  // pausa cuando la pestaña está oculta (no gasta requests ni batería).
+  let telemetryInFlight = false;
+  async function fetchTelemetryGuarded() {
+    if (telemetryInFlight || document.hidden) return;
+    telemetryInFlight = true;
+    try {
+      await fetchTelemetry();
+    } finally {
+      telemetryInFlight = false;
+    }
+  }
+  fetchTelemetryGuarded();
+  setInterval(fetchTelemetryGuarded, 2500);
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) fetchTelemetryGuarded();
+  });
 
   function initThermalControls() {
     const btnCoolDown = document.getElementById('btnCoolDown');
@@ -2694,6 +3252,17 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // Iniciar tracker de inactividad (15 min Mate, 30 min Modorra, 45 min Siesta)
   initInactivityTracker();
+
+  // Escalar la cara a su contenedor (2026-09-17): J2 vertical/horizontal, tablet, monitor
+  fitFaceToViewport();
+  window.addEventListener('resize', fitFaceToViewport);
+  window.addEventListener('orientationchange', fitFaceToViewport);
+  try {
+    const faceStage = document.getElementById('faceTriggerArea');
+    if (faceStage && 'ResizeObserver' in window) {
+      new ResizeObserver(() => fitFaceToViewport()).observe(faceStage);
+    }
+  } catch (e) { /* WebView muy viejo: quedan resize/orientationchange */ }
 
   // Iniciar socket
   connectWebSocket();

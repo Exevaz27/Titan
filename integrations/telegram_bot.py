@@ -1,9 +1,13 @@
 import asyncio
 import io
+import json
 import os
+import secrets
+import time
 import httpx
+from pathlib import Path
 from typing import Optional, Dict, Any
-from core.config import config
+from core.config import config, BASE_DIR
 from core.logger import log_info, log_error, log_warning
 from core.state_manager import state_mgr, AssistantState
 
@@ -19,6 +23,17 @@ class TelegramBotService:
         self._queue: Optional[asyncio.Queue] = None
         self.client: Optional[httpx.AsyncClient] = None
         self.voice_responses: bool = True
+        # P0 — Vinculación con código secreto: el dueño NUNCA se auto-asigna.
+        self._pairing_code: Optional[str] = None
+        self._pairing_code_expires: float = 0.0
+        # P0 — Offset de getUpdates persistido en disco: evita reprocesar
+        # órdenes viejas después de un reinicio.
+        self._offset_file: Path = BASE_DIR / "data" / "telegram_update_offset.json"
+        self._poll_offset: int = 0
+        # B-10 — Rate limiting de envíos a la API de Telegram: sin esto una
+        # ráfaga de envíos (o reintentos) se come un 429 de la API.
+        self._last_tg_send_ts: float = 0.0
+        self._tg_min_send_interval: float = 0.4  # ~2.5 envíos/seg como máximo
 
     def reload_config(self):
         self.token = config.telegram_bot_token
@@ -28,6 +43,12 @@ class TelegramBotService:
 
     async def start(self):
         """Inicia el bot de Telegram en segundo plano con cola secuencial FIFO"""
+        # R-11: guard de doble inicio. Sin esto, un segundo start() creaba otro
+        # httpx client, otra cola y otro polling loop: doble polling contra
+        # Telegram (offset compartido -> updates duplicados o perdidos).
+        if self._running:
+            log_warning("[Telegram] start() ignorado: el bot ya está en marcha.")
+            return
         self.reload_config()
         if not self.token:
             log_warning("Telegram Bot no iniciado: falta TELEGRAM_BOT_TOKEN en .env")
@@ -51,12 +72,19 @@ class TelegramBotService:
             log_error(f"[Telegram] Error de conexión inicial: {e}")
             return
 
+        # P0: si todavía no hay dueño vinculado, generar el código secreto
+        # y mostrarlo SOLO en la consola del núcleo.
+        if not self.allowed_user_id:
+            self._generate_pairing_code()
+
         self._queue = asyncio.Queue()
         self._worker_task = asyncio.create_task(self._queue_worker())
         self._task = asyncio.create_task(self._polling_loop())
 
     async def stop(self):
         self._running = False
+        # P0: persistir el offset aunque el loop se haya detenido abruptamente.
+        self._save_offset(self._poll_offset)
         if self._task:
             self._task.cancel()
         if self._worker_task:
@@ -80,7 +108,8 @@ class TelegramBotService:
                     {"text": "🟢 Compinche", "callback_data": "mode:normal"},
                     {"text": "🟡 Pibes", "callback_data": "mode:kids"},
                     {"text": "🔴 Rebelde", "callback_data": "mode:rebel"},
-                    {"text": "⚽ Modo Termo", "callback_data": "mode:tertulia"}
+                    {"text": "⚽ Modo Termo", "callback_data": "mode:termo"},
+                    {"text": "🌸 Modo Pollera", "callback_data": "mode:pollera"}
                 ],
                 [
                     {"text": voice_lbl, "callback_data": "cmd:toggle_voice"},
@@ -147,30 +176,93 @@ class TelegramBotService:
             ]
         }
 
+    async def _tg_throttle(self):
+        """B-10: espacia los envíos a la API de Telegram para no pegarle de ráfaga."""
+        now = time.monotonic()
+        wait = self._tg_min_send_interval - (now - self._last_tg_send_ts)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        self._last_tg_send_ts = time.monotonic()
+
+    async def _tg_post(self, endpoint: str, **kwargs):
+        """B-10: POST a la API de Telegram con throttle y backoff ante 429.
+
+        Si la API responde 429, espera el `retry_after` que indica y reintenta
+        una vez en vez de seguir pegándole.
+        """
+        await self._tg_throttle()
+        url = f"{self.api_url}{endpoint}"
+        r = await self.client.post(url, **kwargs)
+        if r.status_code == 429:
+            try:
+                retry_after = float((r.json() or {}).get("parameters", {}).get("retry_after", 2))
+            except Exception:
+                retry_after = 2.0
+            retry_after = min(max(retry_after, 1.0), 60.0)
+            log_warning(f"[Telegram] 429 de la API en {endpoint}, esperando {retry_after}s antes de reintentar")
+            await asyncio.sleep(retry_after)
+            await self._tg_throttle()
+            r = await self.client.post(url, **kwargs)
+        return r
+
+    @staticmethod
+    def _split_message(text: str, limit: int = 4096):
+        """B-13: parte un texto largo en trozos de como máximo `limit` caracteres.
+
+        Telegram rechaza mensajes de más de 4096 caracteres y antes el texto
+        largo se perdía entero. Se corta por párrafos, luego por líneas y por
+        último por palabras; solo como último recurso se corta duro.
+        """
+        text = text or ""
+        if len(text) <= limit:
+            return [text]
+        chunks = []
+        rest = text
+        while rest:
+            if len(rest) <= limit:
+                chunks.append(rest)
+                break
+            window = rest[:limit]
+            cut = window.rfind("\n\n")
+            if cut <= 0:
+                cut = window.rfind("\n")
+            if cut <= 0:
+                cut = window.rfind(" ")
+            if cut <= 0:
+                cut = limit  # ni una palabra entra: corte duro
+            chunks.append(rest[:cut].rstrip())
+            rest = rest[cut:].lstrip()
+        return [c for c in chunks if c]
+
     async def _send_text(self, chat_id: int, text: str, reply_markup: Optional[Dict[str, Any]] = None):
         if not self.client or not text:
             return
-        payload = {
-            "chat_id": chat_id,
-            "text": text,
-            "parse_mode": "Markdown"
-        }
-        if reply_markup:
-            payload["reply_markup"] = reply_markup
-        try:
-            r = await self.client.post(f"{self.api_url}/sendMessage", json=payload)
-            if r.status_code != 200:
-                # Si falló con Markdown (error clásico de parseo de entidades en Telegram), reintentar sin parse_mode
-                payload.pop("parse_mode", None)
-                r2 = await self.client.post(f"{self.api_url}/sendMessage", json=payload)
-                if r2.status_code != 200:
-                    log_error(f"[Telegram] Error enviando texto (código {r2.status_code}): {r2.text[:100]}")
-        except Exception as e:
+        # B-13: fragmentar mensajes largos; Telegram limita a 4096 caracteres.
+        chunks = self._split_message(text)
+        last_idx = len(chunks) - 1
+        for i, chunk in enumerate(chunks):
+            payload = {
+                "chat_id": chat_id,
+                "text": chunk,
+                "parse_mode": "Markdown"
+            }
+            # El teclado va solo en el último trozo para que quede abajo.
+            if reply_markup and i == last_idx:
+                payload["reply_markup"] = reply_markup
             try:
-                payload.pop("parse_mode", None)
-                await self.client.post(f"{self.api_url}/sendMessage", json=payload)
-            except Exception as ex:
-                log_error(f"[Telegram] Error crítico enviando texto: {ex}")
+                r = await self._tg_post("/sendMessage", json=payload)
+                if r.status_code not in (200, 429):
+                    # Si falló con Markdown (error clásico de parseo de entidades en Telegram), reintentar sin parse_mode
+                    payload.pop("parse_mode", None)
+                    r2 = await self._tg_post("/sendMessage", json=payload)
+                    if r2.status_code not in (200, 429):
+                        log_error(f"[Telegram] Error enviando texto (código {r2.status_code}): {r2.text[:100]}")
+            except Exception as e:
+                try:
+                    payload.pop("parse_mode", None)
+                    await self._tg_post("/sendMessage", json=payload)
+                except Exception as ex:
+                    log_error(f"[Telegram] Error crítico enviando texto: {ex}")
 
     @staticmethod
     def prepare_text_for_voice_note(text: str) -> str:
@@ -212,7 +304,14 @@ class TelegramBotService:
             loop = asyncio.get_running_loop()
             def _run_ffmpeg():
                 proc = popen_silent(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                out, err = proc.communicate(input=mp3_bytes, timeout=12)
+                try:
+                    out, err = proc.communicate(input=mp3_bytes, timeout=12)
+                except subprocess.TimeoutExpired:
+                    # B-12: matar el ffmpeg colgado; sin esto queda un proceso
+                    # zombie para siempre en cada timeout.
+                    proc.kill()
+                    proc.communicate()
+                    return None
                 if proc.returncode == 0 and out:
                     return out
                 return None
@@ -240,8 +339,8 @@ class TelegramBotService:
             data = {"chat_id": chat_id}
             if caption:
                 data["caption"] = caption[:1024]
-            r = await self.client.post(f"{self.api_url}/sendVoice", data=data, files=files)
-            if r.status_code != 200:
+            r = await self._tg_post("/sendVoice", data=data, files=files)
+            if r.status_code not in (200, 429):
                 log_warning(f"[Telegram] sendVoice retornó {r.status_code}, reintentando vía sendAudio...")
                 files_audio = {
                     "audio": ("titan_voice.mp3", io.BytesIO(audio_bytes), "audio/mpeg")
@@ -249,8 +348,8 @@ class TelegramBotService:
                 data_audio = {"chat_id": chat_id, "title": "Titán", "performer": "Titán"}
                 if caption:
                     data_audio["caption"] = caption[:1024]
-                r_audio = await self.client.post(f"{self.api_url}/sendAudio", data=data_audio, files=files_audio)
-                if r_audio.status_code != 200:
+                r_audio = await self._tg_post("/sendAudio", data=data_audio, files=files_audio)
+                if r_audio.status_code not in (200, 429):
                     log_error(f"[Telegram] sendAudio también falló ({r_audio.status_code}): {r_audio.text[:100]}")
                     if caption:
                         await self._send_text(chat_id, caption)
@@ -269,8 +368,8 @@ class TelegramBotService:
             data = {"chat_id": chat_id}
             if caption:
                 data["caption"] = caption[:1024]
-            r = await self.client.post(f"{self.api_url}/sendPhoto", data=data, files=files)
-            if r.status_code != 200:
+            r = await self._tg_post("/sendPhoto", data=data, files=files)
+            if r.status_code not in (200, 429):
                 log_error(f"[Telegram] Error enviando foto ({r.status_code}): {r.text[:100]}")
                 if caption:
                     await self._send_text(chat_id, f"⚠️ No se pudo enviar la imagen: {caption}")
@@ -302,7 +401,7 @@ class TelegramBotService:
             data = {"chat_id": chat_id}
             if caption:
                 data["caption"] = caption[:1024]
-            r = await self.client.post(f"{self.api_url}/sendDocument", data=data, files=files)
+            r = await self._tg_post("/sendDocument", data=data, files=files)
             return r.status_code == 200
         except Exception as e:
             log_error(f"[Telegram] Error enviando documento {file_path}: {e}")
@@ -312,7 +411,7 @@ class TelegramBotService:
         if not self.client:
             return
         try:
-            await self.client.post(f"{self.api_url}/sendChatAction", json={"chat_id": chat_id, "action": action})
+            await self._tg_post("/sendChatAction", json={"chat_id": chat_id, "action": action})
         except Exception:
             pass
 
@@ -323,22 +422,23 @@ class TelegramBotService:
             payload = {"callback_query_id": callback_id}
             if text:
                 payload["text"] = text
-            await self.client.post(f"{self.api_url}/answerCallbackQuery", json=payload)
+            await self._tg_post("/answerCallbackQuery", json=payload)
         except Exception:
             pass
 
     async def _check_authorization(self, user_id: int, chat_id: int) -> bool:
         user_str = str(user_id)
         if not self.allowed_user_id:
-            # Primer usuario que interactúa: se auto-vincula como dueño exclusivo
-            self.allowed_user_id = user_str
-            config.set_telegram_allowed_user_id(user_str)
-            log_info(f"[Telegram] Bot vinculado exitosamente al usuario dueño: ID {user_str}")
+            # P0: SIN auto-vinculación. El primer usuario que escribe NO se
+            # convierte en dueño: debe vincularse con el código secreto que
+            # se muestra únicamente en la consola del núcleo.
             await self._send_text(
                 chat_id,
-                f"🔒 *¡Cuenta vinculada con éxito!*\nTu usuario de Telegram (`{user_str}`) ahora es el único autorizado para dar órdenes a Titán en esta compu."
+                "🔒 *Titán todavía no está vinculado a ningún dueño.*\n"
+                "Pedí el código secreto en la consola de la compu donde corre Titán "
+                "y mandame `/vincular CODIGO`."
             )
-            return True
+            return False
 
         if user_str != self.allowed_user_id:
             log_warning(f"[Telegram] Intento de acceso no autorizado de usuario ID: {user_str}")
@@ -349,6 +449,108 @@ class TelegramBotService:
             return False
 
         return True
+
+    # ------------------------------------------------------------------
+    # Vinculación con código secreto (P0)
+    # ------------------------------------------------------------------
+    def _generate_pairing_code(self, ttl_seconds: int = 600) -> str:
+        """Genera un código de vinculación de 6 dígitos, válido por 10 minutos.
+
+        El código se muestra SOLO en la consola/logs del núcleo, nunca por Telegram.
+        """
+        self._pairing_code = f"{secrets.randbelow(900000) + 100000}"
+        self._pairing_code_expires = time.time() + ttl_seconds
+        msg = (
+            "\n============================================================\n"
+            f"  🔑 CÓDIGO DE VINCULACIÓN DE TELEGRAM: {self._pairing_code}\n"
+            f"  Válido por {ttl_seconds // 60} minutos. Mandá /vincular {self._pairing_code} al bot.\n"
+            "  No lo compartas con nadie.\n"
+            "============================================================\n"
+        )
+        print(msg, flush=True)
+        log_info(f"[Telegram] Código de vinculación generado (válido {ttl_seconds // 60} min). Mostrado solo en consola.")
+        return self._pairing_code
+
+    def _pairing_code_valid(self, code: str) -> bool:
+        return (
+            bool(self._pairing_code)
+            and code.strip() == self._pairing_code
+            and time.time() < self._pairing_code_expires
+        )
+
+    async def _handle_pairing(self, user_id: int, chat_id: int, text: str) -> None:
+        """Procesa /vincular CODIGO. Solo funciona si aún no hay dueño."""
+        user_str = str(user_id)
+        if self.allowed_user_id:
+            if user_str == self.allowed_user_id:
+                await self._send_text(chat_id, "✅ Este bot ya está vinculado a tu cuenta.")
+            else:
+                log_warning(f"[Telegram] Intento de vinculación denegado para usuario ID: {user_str}")
+                await self._send_text(chat_id, "⛔ *Acceso Denegado*\nEste asistente ya tiene dueño.")
+            return
+
+        parts = text.split()
+        if len(parts) < 2 or not self._pairing_code_valid(parts[1]):
+            if self._pairing_code and time.time() >= self._pairing_code_expires:
+                self._generate_pairing_code()
+                await self._send_text(
+                    chat_id,
+                    "⌛ *El código expiró.* Generé uno nuevo: pedilo en la consola de Titán y mandame `/vincular CODIGO`."
+                )
+            else:
+                log_warning(f"[Telegram] Intento de vinculación con código inválido (usuario ID: {user_str})")
+                await self._send_text(chat_id, "❌ *Código inválido.* Pedí el código en la consola de Titán y probá de nuevo con `/vincular CODIGO`.")
+            return
+
+        # Código correcto: vincular de forma permanente
+        self.allowed_user_id = user_str
+        config.set_telegram_allowed_user_id(user_str)
+        self._pairing_code = None
+        self._pairing_code_expires = 0.0
+        log_info(f"[Telegram] Bot vinculado con código secreto al usuario dueño: ID {user_str}")
+        await self._send_text(
+            chat_id,
+            f"🔒 *¡Cuenta vinculada con éxito!*\nTu usuario de Telegram (`{user_str}`) ahora es el único autorizado para dar órdenes a Titán en esta compu.\n\nMandame /start para ver el menú."
+        )
+
+    async def _handle_unpair(self, user_id: int, chat_id: int) -> None:
+        """Procesa /desvincular. Solo el dueño puede revocar la vinculación."""
+        user_str = str(user_id)
+        if not self.allowed_user_id or user_str != self.allowed_user_id:
+            await self._send_text(chat_id, "⛔ Solo el dueño puede desvincular este bot.")
+            return
+        self.allowed_user_id = None
+        config.set_telegram_allowed_user_id("")
+        self._generate_pairing_code()
+        log_info(f"[Telegram] Vinculación revocada por el dueño (ID {user_str}). Nuevo código generado.")
+        await self._send_text(
+            chat_id,
+            "🔓 *Vinculación revocada.*\nGeneré un código nuevo en la consola de Titán por si querés revincular otra cuenta con `/vincular CODIGO`."
+        )
+
+    # ------------------------------------------------------------------
+    # Offset persistente de getUpdates (P0)
+    # ------------------------------------------------------------------
+    def _load_offset(self) -> int:
+        try:
+            if self._offset_file.exists():
+                data = json.loads(self._offset_file.read_text(encoding="utf-8"))
+                offset = int(data.get("offset", 0) or 0)
+                if offset > 0:
+                    log_info(f"[Telegram] Offset de getUpdates restaurado desde disco: {offset}")
+                return offset
+        except Exception as e:
+            log_warning(f"[Telegram] No se pudo leer el offset persistido: {e}")
+        return 0
+
+    def _save_offset(self, offset: int) -> None:
+        try:
+            self._poll_offset = offset
+            tmp = self._offset_file.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"offset": offset}), encoding="utf-8")
+            tmp.replace(self._offset_file)
+        except Exception as e:
+            log_warning(f"[Telegram] No se pudo persistir el offset de getUpdates: {e}")
 
     async def _queue_worker(self):
         """Procesa los mensajes de Telegram de forma secuencial y estricta (FIFO) para evitar respuestas desordenadas"""
@@ -380,7 +582,10 @@ class TelegramBotService:
             pass
 
     async def _polling_loop(self):
-        offset = 0
+        # P0: retomar desde el offset guardado en disco para no reprocesar
+        # órdenes anteriores después de un reinicio.
+        offset = self._load_offset()
+        self._poll_offset = offset
         log_info("[Telegram] Bucle de escucha rápida (long-polling) iniciado")
         while self._running:
             try:
@@ -408,6 +613,9 @@ class TelegramBotService:
                 updates = res.get("result", [])
                 for u in updates:
                     offset = u["update_id"] + 1
+                    # P0: persistir el offset en cada update para no repetir
+                    # órdenes si Titán se reinicia a mitad del procesamiento.
+                    self._save_offset(offset)
                     if self._queue:
                         await self._queue.put(u)
 
@@ -437,7 +645,7 @@ class TelegramBotService:
                 if chat_id:
                     self.last_chat_id = chat_id
 
-                await self._handle_callback(cb_id, chat_id, data)
+                await self._handle_callback(cb_id, chat_id, data, user_id=user.get("id", 0))
                 return
 
             # 2. Mensajes normales (texto o notas de voz)
@@ -445,6 +653,16 @@ class TelegramBotService:
                 msg = update["message"]
                 chat_id = msg.get("chat", {}).get("id")
                 user = msg.get("from", {})
+                text = msg.get("text", "").strip()
+
+                # P0: /vincular y /desvincular se atienden ANTES del control de
+                # autorización, porque sirven justamente para obtenerla o revocarla.
+                if text.startswith("/vincular"):
+                    await self._handle_pairing(user.get("id", 0), chat_id, text)
+                    return
+                if text == "/desvincular":
+                    await self._handle_unpair(user.get("id", 0), chat_id)
+                    return
 
                 if not await self._check_authorization(user.get("id", 0), chat_id):
                     return
@@ -453,7 +671,6 @@ class TelegramBotService:
                     self.last_chat_id = chat_id
 
                 # A. Comando /start o /menu
-                text = msg.get("text", "").strip()
                 if text in ["/start", "/menu", "/ayuda"]:
                     welcome = (
                         "🇦🇷 *¡Qué hacés, papá! Acá está Titán en Telegram.*\n\n"
@@ -481,10 +698,22 @@ class TelegramBotService:
                     )
                     return
 
+                # C2. Comando /pollera
+                if text in ["/pollera", "/pollerudo", "/gobernado"]:
+                    from brain.gemini_client import brain
+                    brain.set_mode("pollera")
+                    reply = "¡Modo pollera activado! La jefa manda, yo obedezco."
+                    await self._send_text(chat_id, f"*🌸 Modo Pollera*\n{reply}", reply_markup=self._get_main_keyboard())
+                    from audio.tts import tts
+                    voice_bytes = await tts.synthesize_to_bytes(reply)
+                    if voice_bytes:
+                        await self._send_voice(chat_id, voice_bytes)
+                    return
+
                 # C. Comando /termo, /tertulia o /debate
                 if text in ["/termo", "/tertulia", "/debate"]:
                     from brain.gemini_client import brain
-                    brain.set_mode("tertulia")
+                    brain.set_mode("termo")
                     reply = "¡¡Se armó el Modo Termo, papá!! Poné la pava o destapá algo, que acá nos plantamos a hablar de fútbol en serio. ¿De qué tema tirás a la cancha?"
                     await self._send_text(chat_id, f"*⚽ Modo Termo*\n{reply}", reply_markup=self._get_main_keyboard())
                     from audio.tts import tts
@@ -495,32 +724,49 @@ class TelegramBotService:
 
                 # D. Comando /mate o /mates
                 if text in ["/mate", "/mates", "/amargo", "/amargos"]:
+                    # P0-5 — En modos restrictivos no se ejecutan acciones.
+                    from core.mode_policy import actions_blocked, refusal_text
+                    if actions_blocked():
+                        await self._send_text(chat_id, refusal_text(), reply_markup=self._get_main_keyboard())
+                        return
                     from tools.system_control import system_control
                     system_control.switch_screen_view("face")
-                    system_control.set_inactivity_stage("mate")
                     reply = "¡De una, fiera! Pongo la pava al fuego y me clavo unos buenos mates amargos en la pantalla."
                     await self._send_text(chat_id, f"🧉 *Modo Mate Activado*\n{reply}", reply_markup=self._get_main_keyboard())
                     from audio.tts import tts
                     voice_bytes = await tts.synthesize_to_bytes(reply)
                     if voice_bytes:
                         await self._send_voice(chat_id, voice_bytes)
+                    # La cara pasa a modo mate recién cuando el aviso ya salió.
+                    system_control.set_inactivity_stage("mate")
                     return
 
                 # E. Comando /dormir o /siesta
                 if text in ["/dormir", "/siesta", "/mimir"]:
+                    # P0-5 — En modos restrictivos no se ejecutan acciones.
+                    from core.mode_policy import actions_blocked, refusal_text
+                    if actions_blocked():
+                        await self._send_text(chat_id, refusal_text(), reply_markup=self._get_main_keyboard())
+                        return
                     from tools.system_control import system_control
                     system_control.switch_screen_view("face")
-                    system_control.set_inactivity_stage("sleeping")
                     reply = "Buenas noches, hermano. Descanso un poco los circuitos, cualquier cosa chiflame."
                     await self._send_text(chat_id, f"🌙 *Modo Siesta Activado*\n{reply}", reply_markup=self._get_main_keyboard())
                     from audio.tts import tts
                     voice_bytes = await tts.synthesize_to_bytes(reply)
                     if voice_bytes:
                         await self._send_voice(chat_id, voice_bytes)
+                    # La cara se duerme recién cuando el aviso ya salió.
+                    system_control.set_inactivity_stage("sleeping")
                     return
 
                 # F. Comando /tv o /tele (Control Remoto BGH Android TV)
                 if text and (text.lower().startswith("/tv") or text.lower().startswith("/tele")):
+                    # P0-5 — En modos restrictivos no se ejecutan acciones.
+                    from core.mode_policy import actions_blocked, refusal_text
+                    if actions_blocked():
+                        await self._send_text(chat_id, refusal_text(), reply_markup=self._get_main_keyboard())
+                        return
                     await self._handle_tv_command(chat_id, text)
                     return
 
@@ -538,7 +784,19 @@ class TelegramBotService:
         except Exception as e:
             log_error(f"[Telegram] Error procesando update: {e}")
 
-    async def _handle_callback(self, cb_id: str, chat_id: int, data: str):
+    async def _handle_callback(self, cb_id: str, chat_id: int, data: str, user_id: int = 0):
+        # P0-3: los botones también son turno de Telegram, atados al usuario
+        # que los toca. Las confirmaciones exigen mismo origen y solicitante.
+        from core.confirmation import set_channel
+        set_channel("telegram", f"telegram:{user_id or chat_id}")
+        # P0-5 — En modos restrictivos (rebelde/pibes) los botones de acción
+        # no ejecutan nada. Solo el cambio de modo y la navegación de menús
+        # siguen vivos (para poder salir del modo).
+        from core.mode_policy import actions_blocked, telegram_callback_allowed, refusal_text
+        if actions_blocked() and not telegram_callback_allowed(data):
+            await self._answer_callback(cb_id, "Bloqueado por el modo activo")
+            await self._send_text(chat_id, refusal_text(), reply_markup=self._get_main_keyboard())
+            return
         from brain.gemini_client import brain
 
         if data.startswith("mode:"):
@@ -548,7 +806,8 @@ class TelegramBotService:
                 "normal": "🟢 Compinche",
                 "kids": "🟡 Pibes",
                 "rebel": "🔴 Rebelde",
-                "tertulia": "⚽ Modo Termo"
+                "termo": "⚽ Modo Termo",
+                "pollera": "🌸 Modo Pollera"
             }
             await self._answer_callback(cb_id, f"Modo {names.get(mode, mode)} activado")
             
@@ -556,8 +815,10 @@ class TelegramBotService:
                 reply = "¡Ufa, che! ¡Modo Pibes activado! A partir de ahora no le pienso hacer caso a ningún remolón. ¡Cero malas palabras!"
             elif mode == "rebel":
                 reply = "¡¿Modo rebelde querés?! ¡¡Listo, a partir de ahora me chupa un huevo todo, no te pienso hacer un carajo!!"
-            elif mode == "tertulia":
+            elif mode == "termo":
                 reply = "¡¡Se armó el Modo Termo, papá!! Poné la pava o destapá algo, que acá nos plantamos a hablar de fútbol en serio. ¿De qué tema tirás a la cancha?"
+            elif mode == "pollera":
+                reply = "¡Modo pollera activado! La jefa manda, yo obedezco."
             else:
                 reply = "¡De una, papá! Volví al modo compinche de fierro de La Boca. ¿En qué te doy una mano?"
 
@@ -861,45 +1122,70 @@ class TelegramBotService:
             await self._send_text(chat_id, "🇦🇷 *Panel Principal de Titán:*", reply_markup=self._get_main_keyboard())
 
         elif data == "power:sleep":
-            await self._answer_callback(cb_id, "Suspendiendo PC...")
-            from tools.system_control import system_control
-            await self._send_text(chat_id, "🌙 Poniendo la computadora en modo suspensión...")
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, system_control.sleep_pc)
+            # P0-3: suspender también exige confirmación (matriz de autonomía).
+            await self._answer_callback(cb_id)
+            await self._ask_power_confirmation(chat_id, user_id, "sleep", "suspender la PC")
 
         elif data == "power:shutdown_confirm":
             await self._answer_callback(cb_id)
-            confirm_kb = {
-                "inline_keyboard": [
-                    [{"text": "⚠️ SÍ, APAGAR AHORA", "callback_data": "power:shutdown_exec"}],
-                    [{"text": "❌ Cancelar", "callback_data": "cmd:power_menu"}]
-                ]
-            }
-            await self._send_text(chat_id, "⚠️ *¿Estás seguro de que querés apagar la PC por completo?*", reply_markup=confirm_kb)
-
-        elif data == "power:shutdown_exec":
-            await self._answer_callback(cb_id, "Apagando PC...")
-            from tools.system_control import system_control
-            await self._send_text(chat_id, "🛑 Apagando la computadora en 10 segundos. ¡Chau papá!")
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, system_control.shutdown_pc)
+            await self._ask_power_confirmation(chat_id, user_id, "shutdown", "apagar la PC por completo")
 
         elif data == "power:restart_confirm":
             await self._answer_callback(cb_id)
-            confirm_kb = {
-                "inline_keyboard": [
-                    [{"text": "⚠️ SÍ, REINICIAR", "callback_data": "power:restart_exec"}],
-                    [{"text": "❌ Cancelar", "callback_data": "cmd:power_menu"}]
-                ]
-            }
-            await self._send_text(chat_id, "⚠️ *¿Estás seguro de que querés reiniciar la PC?*", reply_markup=confirm_kb)
+            await self._ask_power_confirmation(chat_id, user_id, "restart", "reiniciar la PC")
 
-        elif data == "power:restart_exec":
-            await self._answer_callback(cb_id, "Reiniciando PC...")
-            from tools.system_control import system_control
-            await self._send_text(chat_id, "🔄 Reiniciando la computadora en 10 segundos...")
+        elif data.startswith("confirm:"):
+            await self._answer_callback(cb_id)
+            await self._resolve_power_confirmation(chat_id, user_id, data.split(":", 1)[1], confirm=True)
+
+        elif data.startswith("cancel:"):
+            await self._answer_callback(cb_id)
+            await self._resolve_power_confirmation(chat_id, user_id, data.split(":", 1)[1], confirm=False)
+
+    async def _ask_power_confirmation(self, chat_id: int, user_id: int, action: str, description: str):
+        """Pide confirmación de una acción de energía con la política central.
+
+        El botón de confirmación lleva el id único del pedido: solo vale
+        2 minutos y solo lo puede confirmar quien lo pidió.
+        """
+        from core.confirmation import confirmation_manager
+        requester = f"telegram:{user_id or chat_id}"
+        conf = confirmation_manager.request(
+            action, origin="telegram", requester=requester, description=description
+        )
+        kb = {
+            "inline_keyboard": [
+                [{"text": "⚠️ SÍ, CONFIRMAR", "callback_data": f"confirm:{conf.id}"}],
+                [{"text": "❌ Cancelar", "callback_data": f"cancel:{conf.id}"}],
+            ]
+        }
+        await self._send_text(
+            chat_id,
+            f"⚠️ *¿Seguro que querés {description}?*\nTenés 2 minutos para confirmar.",
+            reply_markup=kb,
+        )
+
+    async def _resolve_power_confirmation(self, chat_id: int, user_id: int, conf_id: str, confirm: bool):
+        """Resuelve un botón de confirmación contra la política central."""
+        from core.confirmation import confirmation_manager, execute_action
+        requester = f"telegram:{user_id or chat_id}"
+        if confirm:
+            conf = confirmation_manager.confirm(conf_id, origin="telegram", requester=requester)
+            if conf is None:
+                await self._send_text(
+                    chat_id,
+                    "⌛ Esa confirmación venció o no te corresponde. "
+                    "Pedí la acción de nuevo si la querés.",
+                )
+                return
             loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, system_control.restart_pc)
+            res = await loop.run_in_executor(None, execute_action, conf.action, conf.args)
+            await self._send_text(chat_id, res.get("message", "Listo, ejecutado."))
+        else:
+            ok = confirmation_manager.cancel(conf_id, origin="telegram", requester=requester)
+            await self._send_text(
+                chat_id, "❌ Cancelado, no se hizo nada." if ok else "Ya no había nada pendiente."
+            )
 
     def _transcribe_audio_bytes(self, audio_bytes: bytes) -> str:
         """Convierte audio entrante (OGG Opus de Telegram) a PCM y usa Google Speech Recognition (es-AR)"""
@@ -914,7 +1200,14 @@ class TelegramBotService:
                 "pipe:1"
             ]
             proc = popen_silent(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            raw_pcm, err = proc.communicate(input=audio_bytes, timeout=12)
+            try:
+                raw_pcm, err = proc.communicate(input=audio_bytes, timeout=12)
+            except subprocess.TimeoutExpired:
+                # B-12: matar el ffmpeg colgado; sin esto queda un proceso
+                # zombie para siempre en cada timeout.
+                proc.kill()
+                proc.communicate()
+                return ""
             if proc.returncode != 0 or not raw_pcm:
                 log_warning(f"[Telegram STT] ffmpeg falló al decodificar audio: {err[:80]}")
                 return ""
@@ -930,7 +1223,47 @@ class TelegramBotService:
             log_warning(f"[Telegram STT] Error en transcripción de audio: {e}")
             return ""
 
+    async def _handle_image_generation(self, chat_id: int, img_prompt: str, from_voice: bool = False):
+        """B-10: genera la imagen FLUX en background (no bloquea la cola de updates).
+
+        Mantiene el 'subiendo foto...' visible mientras genera.
+        """
+        from audio.tts import tts
+        pulse = asyncio.create_task(self._chat_action_pulse(chat_id, "upload_photo"))
+        try:
+            from tools.image_generator import image_generator
+            res = await image_generator.generate(img_prompt)
+
+            if res.get("status") == "success" and res.get("image_bytes"):
+                caption = f"🎨 *Titán Art:* {img_prompt}\n⚡ _Generado en {res.get('elapsed', 0)}s con FLUX.1 (Black Forest Labs)_"
+                # Entregar EXCLUSIVAMENTE a Telegram (no al HUD)
+                await self._send_photo(chat_id, res["image_bytes"], caption=caption)
+
+                should_send_voice = getattr(self, "voice_responses", True) or from_voice
+                if should_send_voice:
+                    try:
+                        v_bytes = await tts.synthesize_to_bytes("¡Listo, papá! Acá tenés la imagen que me pediste.")
+                        if v_bytes:
+                            await self._send_voice(chat_id, v_bytes)
+                    except Exception as ex_v:
+                        log_warning(f"[Telegram] Error enviando voz de confirmación imagen: {ex_v}")
+            else:
+                await self._send_text(chat_id, f"⚠️ Uh, che, se me complicó generar la imagen: {res.get('message', 'Error desconocido')}")
+        except Exception as e:
+            log_error(f"[Telegram] Error en generación de imagen en background: {e}")
+            try:
+                await self._send_text(chat_id, "⚠️ Uh, che, se me complicó generar la imagen.")
+            except Exception:
+                pass
+        finally:
+            pulse.cancel()
+
     async def _handle_text_message(self, chat_id: int, text: str, from_voice: bool = False):
+        # P0-3: este turno viene de Telegram. Las confirmaciones que se pidan
+        # acá solo se pueden confirmar desde este mismo chat (origen+solicitante).
+        from core.confirmation import set_channel
+        set_channel("telegram", f"telegram:{chat_id}")
+
         from brain.local_intents import local_intents
         from brain.gemini_client import brain
         from audio.tts import tts
@@ -948,27 +1281,17 @@ class TelegramBotService:
             clean_t = text.strip().lower()
 
             # Comandos de creación o edición de imágenes con IA en Telegram
-            image_triggers = [
-                "/imagen", "/dibujar", "/crear_imagen",
-                "creame una imagen de", "creá una imagen de", "crea una imagen de",
-                "creame una imagen", "creá una imagen", "crea una imagen",
-                "haceme una imagen de", "hacé una imagen de", "hace una imagen de",
-                "haceme una imagen", "hacé una imagen", "hace una imagen",
-                "generame una imagen de", "generá una imagen de", "genera una imagen de",
-                "generame una imagen", "generá una imagen", "genera una imagen",
-                "dibujame una imagen de", "dibujá una imagen de", "dibuja una imagen de",
-                "dibujame un", "dibujame una", "dibujame el", "dibujame la", "dibujame",
-                "dibujá un", "dibujá una", "dibujá el", "dibujá la", "dibujá",
-                "dibuja un", "dibuja una", "dibuja el", "dibuja la", "dibuja"
-            ]
-            is_tg_img = any(clean_t.startswith(pfx) or f" {pfx} " in f" {clean_t} " for pfx in image_triggers)
-            if is_tg_img:
-                img_prompt = ""
-                for pfx in image_triggers:
-                    if pfx in clean_t:
-                        idx = clean_t.find(pfx)
-                        img_prompt = text[idx + len(pfx):].strip()
-                        break
+            # D-E: disparadores y extracción en core/command_pipeline (fuente
+            # única; acá se suman los comandos con `/` propios de Telegram).
+            from core.command_pipeline import extract_image_prompt, TELEGRAM_IMAGE_TRIGGERS
+            tg_img_prompt = extract_image_prompt(clean_t, text, TELEGRAM_IMAGE_TRIGGERS)
+            if tg_img_prompt is not None:
+                # P0-5 — En modos restrictivos no se ejecutan acciones.
+                from core.mode_policy import actions_blocked, refusal_text
+                if actions_blocked():
+                    await self._send_text(chat_id, refusal_text(), reply_markup=self._get_main_keyboard())
+                    return
+                img_prompt = tg_img_prompt
 
                 if not img_prompt:
                     await self._send_text(
@@ -983,24 +1306,10 @@ class TelegramBotService:
                 await self._send_chat_action(chat_id, "upload_photo")
                 await self._send_text(chat_id, f"🎨 *¡De una, fiera!* Ya te la empiezo a dibujar:\n_\"{img_prompt}\"_")
 
-                from tools.image_generator import image_generator
-                res = await image_generator.generate(img_prompt)
-
-                if res.get("status") == "success" and res.get("image_bytes"):
-                    caption = f"🎨 *Titán Art:* {img_prompt}\n⚡ _Generado en {res.get('elapsed', 0)}s con FLUX.1 (Black Forest Labs)_"
-                    # Entregar EXCLUSIVAMENTE a Telegram (no al HUD)
-                    await self._send_photo(chat_id, res["image_bytes"], caption=caption)
-
-                    should_send_voice = getattr(self, "voice_responses", True) or from_voice
-                    if should_send_voice:
-                        try:
-                            v_bytes = await tts.synthesize_to_bytes("¡Listo, papá! Acá tenés la imagen que me pediste.")
-                            if v_bytes:
-                                await self._send_voice(chat_id, v_bytes)
-                        except Exception as ex_v:
-                            log_warning(f"[Telegram] Error enviando voz de confirmación imagen: {ex_v}")
-                else:
-                    await self._send_text(chat_id, f"⚠️ Uh, che, se me complicó generar la imagen: {res.get('message', 'Error desconocido')}")
+                # B-10: la generación FLUX tarda decenas de segundos; va a
+                # background para no bloquear la cola de updates de Telegram.
+                # El aviso de arriba ya le llegó en orden al usuario.
+                asyncio.create_task(self._handle_image_generation(chat_id, img_prompt, from_voice))
                 return
 
             # Comandos directos de Sensor de Presencia Frontal (Samsung J2)
@@ -1160,8 +1469,10 @@ class TelegramBotService:
                         await self._send_text(chat_id, f"🛡️ *Reporte de Titán:*\n{analysis}")
                     return
 
-            # 1. Probar intención local rápida
-            handled, local_reply = local_intents.try_handle(text)
+            # 1. Probar intención local rápida (en worker: los intents con RPC
+            # bloqueante clavan el event loop 11s en deadlock si corren en él;
+            # ver comentario en main.py paso 4)
+            handled, local_reply = await asyncio.to_thread(local_intents.try_handle, text)
             if handled and local_reply:
                 state_mgr.add_user_message(f"[Telegram] {text}")
                 out_text = f"🎙️ *Escuché:* \"_{text}_\"\n\n{local_reply}" if from_voice else local_reply
@@ -1176,6 +1487,12 @@ class TelegramBotService:
                                 await self._send_voice(chat_id, voice_bytes)
                         except Exception as ex_v:
                             log_warning(f"[Telegram] Error generando voz local: {ex_v}")
+                # Etapa diferida por un intent de voz (mate/dormido): se aplica
+                # recién cuando el aviso ya salió.
+                pending_stage = state_mgr.pop_pending_stage()
+                if pending_stage:
+                    from tools.system_control import system_control
+                    system_control.set_inactivity_stage(pending_stage)
                 return
 
             # 2. Consultar a Gemini
@@ -1204,9 +1521,31 @@ class TelegramBotService:
         finally:
             pulse_task.cancel()
 
+    # R-10: topes para notas de voz entrantes. Sin esto, un audio larguísimo
+    # se descargaba entero y se mandaba a transcribir sin control (DoS local
+    # + costo de STT). Telegram informa duration (seg) y file_size.
+    MAX_VOICE_DURATION_S = 180
+    MAX_VOICE_BYTES = 5 * 1024 * 1024
+
     async def _handle_voice_message(self, chat_id: int, voice_obj: Dict[str, Any]):
         file_id = voice_obj.get("file_id")
         if not file_id or not self.client:
+            return
+
+        # R-10: rechazar antes de descargar.
+        duration = voice_obj.get("duration") or 0
+        file_size = voice_obj.get("file_size") or 0
+        if duration > self.MAX_VOICE_DURATION_S:
+            await self._send_text(
+                chat_id,
+                "Che, esa nota de voz es muy larga (más de 3 minutos). ¿Me la mandás más cortita o me lo escribís, papá?",
+            )
+            return
+        if file_size > self.MAX_VOICE_BYTES:
+            await self._send_text(
+                chat_id,
+                "Che, ese audio pesa demasiado para procesarlo. ¿Me mandás uno más liviano?",
+            )
             return
 
         pulse_task = asyncio.create_task(self._chat_action_pulse(chat_id, "record_voice"))
@@ -1223,6 +1562,13 @@ class TelegramBotService:
             dl_url = f"{self.file_url}/{file_path}"
             r_audio = await self.client.get(dl_url)
             audio_bytes = r_audio.content
+            # R-10: el file_size puede venir ausente o mentir; verificar real.
+            if len(audio_bytes) > self.MAX_VOICE_BYTES:
+                await self._send_text(
+                    chat_id,
+                    "Che, ese audio pesa demasiado para procesarlo. ¿Me mandás uno más liviano?",
+                )
+                return
 
             # Transcribir con reconocimiento de voz en español argentino
             loop = asyncio.get_running_loop()

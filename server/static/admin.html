@@ -34,6 +34,7 @@
       <select id="deviceRole">
         <option value="api">Celular / HUD</option>
         <option value="satellite">PC Windows</option>
+        <option value="admin">Administrador (puede gestionar dispositivos)</option>
       </select>
     </label>
     <button onclick="enroll()">Autorizar</button>
@@ -63,10 +64,41 @@ async function load() {
   const response = await fetch('/api/admin/devices');
   if (!response.ok) { show('No autorizado o servidor no disponible.'); return; }
   const data = await response.json();
-  document.getElementById('registered').innerHTML = Object.entries(data.registered).map(([id, d]) =>
-    `<li><strong>${id}</strong> - ${d.enabled ? 'activo' : 'revocado'} - ${d.roles.join(', ')} ${d.enabled ? `<button class="danger" onclick="revoke('${id}')">Revocar</button>` : ''}</li>`).join('') || '<li>Ninguno</li>';
-  document.getElementById('connected').innerHTML = data.connected.map(d =>
-    `<li><strong>${d.device_id || 'sin identificar'}</strong> - ${d.role || 'cliente'} - ${d.hostname || ''} - ${d.host || ''}</li>`).join('') || '<li>Ninguno</li>';
+  // S-5: antes se interpolaban device_id/hostname/host directo en innerHTML
+  // (XSS: un device_id con comillas rompía el onclick="revoke('...')").
+  // Ahora se construye el DOM con textContent y addEventListener.
+  const regUl = document.getElementById('registered');
+  regUl.replaceChildren();
+  const entries = Object.entries(data.registered || {});
+  if (!entries.length) regUl.appendChild(mkEl('li', 'Ninguno'));
+  for (const [id, d] of entries) {
+    const li = mkEl('li');
+    li.appendChild(mkEl('strong', id));
+    li.append(` - ${d.enabled ? 'activo' : 'revocado'} - ${(d.roles || []).join(', ')} `);
+    if (d.enabled) {
+      const btn = mkEl('button', 'Revocar');
+      btn.className = 'danger';
+      btn.addEventListener('click', () => revoke(id));
+      li.appendChild(btn);
+    }
+    regUl.appendChild(li);
+  }
+  const conUl = document.getElementById('connected');
+  conUl.replaceChildren();
+  const conns = data.connected || [];
+  if (!conns.length) conUl.appendChild(mkEl('li', 'Ninguno'));
+  for (const d of conns) {
+    const li = mkEl('li');
+    li.appendChild(mkEl('strong', d.device_id || 'sin identificar'));
+    li.append(` - ${d.role || 'cliente'} - ${d.hostname || ''} - ${d.host || ''}`);
+    conUl.appendChild(li);
+  }
+}
+// S-5: helper para crear elementos con texto seguro (textContent, no innerHTML).
+function mkEl(tag, text) {
+  const e = document.createElement(tag);
+  if (text !== undefined && text !== null) e.textContent = text;
+  return e;
 }
 async function enroll() {
   const roles = [document.getElementById('deviceRole').value];

@@ -3,19 +3,30 @@ import threading
 import time
 import numpy as np
 import speech_recognition as sr
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Callable, Any
 from core.state_manager import state_mgr, AssistantState
 from core.logger import log_info, log_error, log_warning, log_success
 from audio.wake_word import wake_detector
 
+# Huella de voz (2026-09-18): pool chico para pedir el embedding al satélite
+# EN PARALELO con el STT, sin sumar latencia a la respuesta.
+_HUELLAPOOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="huella")
+
 class AudioListener:
     def __init__(self):
         self.recognizer = sr.Recognizer()
         self.recognizer.energy_threshold = 240
-        self.recognizer.dynamic_energy_threshold = False
+        # Umbral DINÁMICO: se adapta solo al ruido ambiente (fix 2026-09-15:
+        # con el umbral fijo la calibración quedaba clavada en 350 y había
+        # que hablar fuerte para que el mic siquiera empezara a escuchar)
+        self.recognizer.dynamic_energy_threshold = True
         self.recognizer.dynamic_energy_adjustment_damping = 0.15
         self.recognizer.dynamic_energy_ratio = 1.3
-        self.recognizer.pause_threshold = 1.0
+        # 2026-09-18: la pausa se ajusta por ciclo (ver bucle principal):
+        # 0.9s en reposo (wake word rápido), 1.8s en conversación (las pausas
+        # naturales no parten la frase en dos comandos).
+        self.recognizer.pause_threshold = 0.9
         self.recognizer.non_speaking_duration = 0.5
         self.microphone: Optional[sr.Microphone] = None
         self._is_running = False
@@ -46,7 +57,9 @@ class AudioListener:
                 self.recognizer.adjust_for_ambient_noise(source, duration=0.8)
                 calib = int(self.recognizer.energy_threshold)
                 self.recognizer.energy_threshold = max(140, min(calib, 350))
-                self.recognizer.dynamic_energy_threshold = False
+                # No forzar el umbral fijo: dynamic_energy_threshold=True (ver __init__)
+                # deja que se adapte solo a partir de la calibración inicial
+                self.recognizer.dynamic_energy_threshold = True
                 log_info(f"Calibración completada (Umbral de energía: {int(self.recognizer.energy_threshold)})")
             self.microphone = mic
             return True
@@ -152,6 +165,13 @@ class AudioListener:
                         time_limit = 2.0 if is_speaking else (9.0 if was_conversing else 6.0)
                         listen_timeout = 0.8 if is_speaking else 2.0
 
+                        # 2026-09-18: pausa adaptativa — en conversación se espera
+                        # 1.8s de silencio antes de cortar la frase (las pausas
+                        # naturales ya no parten "prende la tele / del living"
+                        # en dos comandos). En reposo se mantiene 0.9s para que
+                        # el wake word responda rápido.
+                        self.recognizer.pause_threshold = 1.8 if was_conversing else 0.9
+
                         try:
                             audio = self.recognizer.listen(source, timeout=listen_timeout, phrase_time_limit=time_limit)
                         except sr.WaitTimeoutError:
@@ -164,6 +184,39 @@ class AudioListener:
 
                         # Extraer nivel de audio para el visualizador
                         self._emit_volume(audio)
+
+                        # 2026-09-18 — Huella de voz: si hay un registro en curso
+                        # ("registrá mi voz"), el audio va al enroller: no se
+                        # transcribe ni se procesa como orden.
+                        try:
+                            from audio.speaker_id import (
+                                enrollment_active, handle_enrollment_audio)
+                            if enrollment_active():
+                                try:
+                                    prompt = handle_enrollment_audio(
+                                        audio.get_raw_data(), audio.sample_rate, loop)
+                                    if prompt:
+                                        from audio.tts import tts as _tts
+                                        asyncio.run_coroutine_threadsafe(
+                                            _tts.speak(prompt, auto_listen=True), loop)
+                                except Exception as ex:
+                                    log_warning(f"[Huella] error en registro: {ex}")
+                                continue
+                        except Exception:
+                            pass
+
+                        # 2026-09-18 — Huella de voz: pedir el embedding al
+                        # satélite EN PARALELO con el STT (no suma latencia).
+                        # Solo si hay huellas registradas.
+                        huella_future = None
+                        try:
+                            from audio import speaker_id as huella
+                            if huella.list_voiceprints():
+                                huella_future = _HUELLAPOOL.submit(
+                                    huella.fetch_embedding,
+                                    audio.get_raw_data(), audio.sample_rate, loop, 5.0)
+                        except Exception:
+                            huella_future = None
 
                         # Intentar transcribir
                         try:
@@ -186,6 +239,7 @@ class AudioListener:
 
                             # A. FILTRO ANTI-ECO: Si coincide con lo que Titán acaba de decir por los parlantes, descartar
                             if tts.is_self_echo(clean_lower):
+                                log_info(f"[Mic PC] Descartado por anti-eco (coincide con lo que dijo Titán): '{text}'")
                                 continue
 
                             # B. MODO INTERRUPCIÓN RÁPIDA (Barge-In) mientras Titán está hablando:
@@ -201,11 +255,13 @@ class AudioListener:
                                     continue
                                 else:
                                     # Mientras habla, si no fue una frase compuesta de interrupción, descartar para evitar auto-interrupciones o falsos positivos
+                                    log_info(f"[Mic PC] Descartado (Titán hablando y no es frase de interrupción): '{text}'")
                                     continue
 
                             # C. MODO NORMAL (Titán NO está hablando):
                             # Si recién terminó de hablar (menos de 0.4s), chequear margen de eco residual
                             if time.time() - getattr(tts, "last_speech_time", 0) < 0.4:
+                                log_info(f"[Mic PC] Descartado (margen de eco: Titán terminó de hablar hace <0.4s): '{text}'")
                                 continue
 
                             detected, remainder = wake_detector.check(text)
@@ -230,12 +286,16 @@ class AudioListener:
 
                                 speaker_monitor.duck(0.15)
                                 if self._on_command_callback:
+                                    self._huella_identificar(huella_future)
                                     asyncio.run_coroutine_threadsafe(self._on_command_callback(cmd_to_send), loop)
                             elif was_conversing and not media_active:
                                 self.is_waiting_for_command = False
                                 log_info(f"[Mic PC] Conversación continua: '{text}'")
                                 if self._on_command_callback:
+                                    self._huella_identificar(huella_future)
                                     asyncio.run_coroutine_threadsafe(self._on_command_callback(text), loop)
+                            else:
+                                log_info(f"[Mic PC] Ignorado (sin 'Titán' y sin conversación abierta): '{text}'")
                         except sr.UnknownValueError:
                             pass
                         except sr.RequestError as e:
@@ -252,6 +312,20 @@ class AudioListener:
                 state_mgr.set_state(AssistantState.IDLE, "⚠️ Micrófono desconectado")
                 threading.Event().wait(2.0)
 
+    def _huella_identificar(self, huella_future):
+        """2026-09-18 — Huella de voz: resuelve el embedding pedido en paralelo
+        con el STT y fija quién habla (insignia del HUD + prompt del cerebro)."""
+        if huella_future is None:
+            return
+        try:
+            from audio import speaker_id as huella
+            emb = huella_future.result(timeout=6.0)
+            if emb:
+                identity, score = huella.match_embedding(emb)
+                state_mgr.set_speaker_identity(identity, score)
+        except Exception:
+            pass
+
     def _capture_and_dispatch(self, source, loop: asyncio.AbstractEventLoop, prompt: str = "Escuchando orden..."):
         """Captura síncronamente el audio en el hilo del micrófono para evitar colisiones PortAudio"""
         from audio.tts import tts
@@ -259,7 +333,28 @@ class AudioListener:
         speaker_monitor.duck(0.15)
         state_mgr.set_state(AssistantState.LISTENING, prompt)
         try:
+            # Captura manual = siempre es un comando: pausa larga para no
+            # partir la frase (ver pausa adaptativa en el bucle principal).
+            self.recognizer.pause_threshold = 1.8
             audio = self.recognizer.listen(source, timeout=6.0, phrase_time_limit=10.0)
+            # 2026-09-18 — Huella de voz: en pleno registro el audio va al
+            # enroller, no se procesa como orden.
+            try:
+                from audio.speaker_id import enrollment_active, handle_enrollment_audio
+                if enrollment_active():
+                    try:
+                        prompt2 = handle_enrollment_audio(
+                            audio.get_raw_data(), audio.sample_rate, loop)
+                        if prompt2:
+                            asyncio.run_coroutine_threadsafe(
+                                tts.speak(prompt2, auto_listen=True), loop)
+                    except Exception as ex:
+                        log_warning(f"[Huella] error en registro: {ex}")
+                    state_mgr.set_state(AssistantState.IDLE, "En espera")
+                    speaker_monitor.unduck()
+                    return
+            except Exception:
+                pass
             # Si mientras escuchaba el asistente habló, descartar
             if state_mgr.current_state == AssistantState.SPEAKING or getattr(tts, "_is_speaking", False) or (time.time() - getattr(tts, "last_speech_time", 0) < 0.5):
                 state_mgr.set_state(AssistantState.IDLE, "En espera")
@@ -285,7 +380,25 @@ class AudioListener:
                     return
                 log_info(f"Orden reconocida (PC): '{text}'")
                 if self._on_command_callback:
-                    asyncio.run_coroutine_threadsafe(self._on_command_callback(text), loop)
+                    fut = asyncio.run_coroutine_threadsafe(self._on_command_callback(text), loop)
+                    # B-14: restaurar el volumen cuando la orden termina de
+                    # procesarse (el Future completa tras el tts.speak de la
+                    # respuesta, que se espera con await). Antes solo se
+                    # restauraba en los caminos de error o al terminar el TTS:
+                    # las órdenes sin respuesta de voz dejaban la música
+                    # atenuada hasta el failsafe del satélite (35s).
+                    def _restore_volume(f):
+                        try:
+                            f.result()  # consume la excepción si la hubo
+                        except Exception:
+                            pass
+                        try:
+                            speaker_monitor.unduck()
+                        except Exception:
+                            pass
+                    fut.add_done_callback(_restore_volume)
+                else:
+                    speaker_monitor.unduck()
             else:
                 state_mgr.set_state(AssistantState.IDLE, "No se detectó ninguna orden")
                 speaker_monitor.unduck()

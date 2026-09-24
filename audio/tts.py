@@ -14,6 +14,16 @@ from core.state_manager import state_mgr, AssistantState
 from core.logger import log_info, log_error, log_warning
 
 class TTSEngine:
+    # B-8: si Edge-TTS se queda más de N segundos sin entregar audio se lo
+    # considera colgado y se aborta la síntesis (antes quedaba esperando
+    # para siempre y Titán quedaba mudo).
+    _TTS_CHUNK_TIMEOUT_S = 25.0
+    # B-17: cota real para recent_utterances. Antes solo se podaba dentro de
+    # is_self_echo (que solo corre cuando el mic reconoce algo); en uso puro
+    # por Telegram/HUD la lista crecía sin límite.
+    _RECENT_UTTERANCE_WINDOW_S = 10.0
+    _MAX_RECENT_UTTERANCES = 50
+
     def __init__(self):
         self.voice: str = config.tts_voice
         self._is_speaking: bool = False
@@ -24,7 +34,22 @@ class TTSEngine:
         self.recent_utterances: list = []  # Lista de tuplas (timestamp, texto)
         self.last_speech_time: float = 0.0
         self.on_speech_finished = None
+        # B-8: dos speak() concurrentes se pisaban (_is_speaking, mixer,
+        # avisos al HUD). Con el lock se serializan: el segundo espera.
+        self._speak_lock = asyncio.Lock()
         self._init_mixer()
+
+    def _remember_utterance(self, text: str):
+        """B-17: guarda una frase en recent_utterances podando por tiempo
+        (ventana de 10s) y por cantidad (tope de 50). Así la lista no crece
+        sin límite cuando is_self_echo nunca corre (uso puro Telegram/HUD)."""
+        import time
+        now = time.time()
+        self.recent_utterances.append((now, text))
+        self.recent_utterances = [
+            (t, u) for (t, u) in self.recent_utterances
+            if now - t < self._RECENT_UTTERANCE_WINDOW_S
+        ][-self._MAX_RECENT_UTTERANCES:]
 
     def is_self_echo(self, text: str) -> bool:
         """Verifica con alta precisión si un texto reconocido proviene del eco de los altavoces de Titán"""
@@ -41,26 +66,40 @@ class TTSEngine:
             return False
 
         now = time.time()
-        # Si Titán NO está hablando y ya pasaron más de 1.5s desde que terminó,
-        # NO es eco bajo ninguna circunstancia. El usuario está conversando normalmente.
-        if not self._is_speaking and (now - getattr(self, "last_speech_time", 0) > 1.5):
-            return False
+        # FIX 2026-09-15 (eco tardío): antes, si pasaban más de 1.5s desde que
+        # Titán terminó de hablar, NADA se consideraba eco aunque el texto
+        # coincidiera con algo que dijo. Pero Google STT tarda 1-3s en devolver
+        # la transcripción: el eco de los parlantes llegaba tarde, pasaba el
+        # filtro y se procesaba como orden del usuario (Titán hablándose a sí
+        # mismo en loop, porque la ventana conversacional de 10s está abierta
+        # justo después de cada TTS). Ahora hay dos niveles:
+        #  - Coincidencia FUERTE (texto idéntico, o >=85% de las palabras
+        #    escuchadas con >=3 palabras): vale durante toda la ventana de
+        #    frases recientes (10s). Una transcripción tardía del propio Titán
+        #    casi siempre cae acá.
+        #  - Coincidencia difusa (>=60%): solo dentro de 1.5s de gracia, como
+        #    antes. Más allá, el riesgo de confundir una pregunta real del
+        #    usuario (que repite palabras del tema) es mayor que el beneficio.
+        # Mantener frases de los últimos 10 segundos (las entradas guardan el
+        # inicio de la frase y una frase larga puede durar varios segundos).
+        self.recent_utterances = [(t, u) for (t, u) in self.recent_utterances if now - t < self._RECENT_UTTERANCE_WINDOW_S]
 
-        # Mantener solo frases de los últimos 5 segundos
-        self.recent_utterances = [(t, u) for (t, u) in self.recent_utterances if now - t < 5.0]
+        in_grace = self._is_speaking or (now - getattr(self, "last_speech_time", 0) <= 1.5)
 
         for t_spoken, utterance in self.recent_utterances:
             clean_utt = "".join(c for c in utterance.lower() if c.isalnum() or c.isspace()).strip()
             if not clean_utt:
                 continue
 
-            # Coincidencia exacta o contenida
-            if clean_text in clean_utt or clean_utt in clean_text:
+            overlap = sum(1 for w in words_heard if w in clean_utt)
+            ratio = overlap / len(words_heard)
+
+            # Fuerte: idéntico o casi todas las palabras escuchadas están en la frase
+            if clean_text == clean_utt or (len(words_heard) >= 3 and ratio >= 0.85):
                 return True
 
-            # Coincidencia de palabras clave mientras suena el audio
-            overlap = sum(1 for w in words_heard if w in clean_utt)
-            if (overlap / len(words_heard)) >= 0.60:
+            # Difusa: como antes, solo en ventana de gracia
+            if in_grace and ratio >= 0.60:
                 return True
 
         return False
@@ -220,7 +259,23 @@ class TTSEngine:
                 volume=v_params["volume"]
             )
             chunks = []
-            async for chunk in communicate.stream():
+            # B-8: timeout por chunk en vez de `async for` pelado — si el
+            # stream se cuelga (red trabada) se aborta en vez de esperar
+            # para siempre.
+            stream_iter = communicate.stream().__aiter__()
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(
+                        stream_iter.__anext__(), timeout=self._TTS_CHUNK_TIMEOUT_S
+                    )
+                except StopAsyncIteration:
+                    break
+                except asyncio.TimeoutError:
+                    log_warning(
+                        f"Edge-TTS colgado ({self._TTS_CHUNK_TIMEOUT_S}s sin audio) "
+                        f"para '{spoken_text[:40]}...' — síntesis abortada"
+                    )
+                    return b""
                 if chunk["type"] == "audio":
                     chunks.append(chunk["data"])
             return b"".join(chunks)
@@ -287,7 +342,11 @@ class TTSEngine:
             self._current_channel = None
 
     async def speak(self, text: str, auto_listen: bool = True):
-        """Genera audio con Edge-TTS en memoria RAM y lo reproduce sin tocar disco"""
+        """Genera audio con Edge-TTS en memoria RAM y lo reproduce sin tocar disco.
+
+        B-8: serializado con _speak_lock — dos speak() concurrentes se pisaban
+        (_is_speaking, mixer, avisos al HUD). El que llega segundo espera su turno.
+        """
         if not text or not text.strip():
             return
 
@@ -300,11 +359,15 @@ class TTSEngine:
         if not clean_text:
             return
 
+        async with self._speak_lock:
+            await self._speak_impl(clean_text, text, auto_listen)
+
+    async def _speak_impl(self, clean_text: str, original_text: str, auto_listen: bool = True):
         self._interrupted = False
         self._is_speaking = True
         self.current_text = clean_text
         import time
-        self.recent_utterances.append((time.time(), clean_text))
+        self._remember_utterance(clean_text)
 
         raw_bytes = await self.synthesize_to_bytes(clean_text)
         if not raw_bytes or self._interrupted:
@@ -322,10 +385,10 @@ class TTSEngine:
             state_mgr._notify({
                 "type": "play_audio",
                 "audio_base64": b64_audio,
-                "text": text
+                "text": original_text
             })
 
-            await self._play_sound_with_level_tracking(bio, text)
+            await self._play_sound_with_level_tracking(bio, original_text)
 
         except Exception as e:
             log_error(f"Error en síntesis/reproducción TTS en memoria: {e}")
@@ -373,7 +436,14 @@ class TTSEngine:
                 pass
 
     async def speak_stream(self, sentence_gen, auto_listen: bool = True):
-        """Sintetiza y reproduce oraciones en streaming con precarga paralela 100% en memoria RAM (latencia mínima)"""
+        """Sintetiza y reproduce oraciones en streaming con precarga paralela 100% en memoria RAM (latencia mínima)
+
+        B-8: serializado con _speak_lock, igual que speak().
+        """
+        async with self._speak_lock:
+            await self._speak_stream_impl(sentence_gen, auto_listen)
+
+    async def _speak_stream_impl(self, sentence_gen, auto_listen: bool = True):
         self._interrupted = False
         self._is_speaking = True
 
@@ -423,7 +493,7 @@ class TTSEngine:
                     break
 
                 self.current_text = s
-                self.recent_utterances.append((time.time(), s))
+                self._remember_utterance(s)
                 state_mgr.add_assistant_message(s)
 
                 try:

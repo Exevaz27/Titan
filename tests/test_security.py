@@ -4,8 +4,8 @@ from pathlib import Path
 
 from core.path_security import safe_zip_member_path
 from core.security import (
-    _is_loopback,
     _token_from_headers,
+    api_devices_exist,
     token_is_valid,
     token_is_valid_for_roles,
 )
@@ -41,10 +41,24 @@ class TestSecurityPrimitives(unittest.TestCase):
         self.assertEqual(_token_from_headers({"x-titan-token": "custom"}), "custom")
         self.assertEqual(_token_from_headers({"cookie": "foo=bar; titan_token=cookie-token"}), "cookie-token")
 
-    def test_loopback_detection_is_strict(self):
-        self.assertTrue(_is_loopback("127.0.0.1"))
-        self.assertTrue(_is_loopback("localhost"))
-        self.assertFalse(_is_loopback("192.168.1.20"))
+    def test_api_devices_exist(self):
+        # P0: sin dispositivos con rol api -> False (dispara código de setup)
+        import core.security as security_mod
+        from core.device_registry import DeviceRegistry
+        from tempfile import TemporaryDirectory
+        from pathlib import Path
+        with TemporaryDirectory() as d:
+            tmp_reg = DeviceRegistry(path=Path(d) / "auth.json")
+            old = security_mod.registry
+            security_mod.registry = tmp_reg
+            try:
+                self.assertFalse(api_devices_exist())
+                tmp_reg.enroll("satelite", ["satellite"])
+                self.assertFalse(api_devices_exist())
+                tmp_reg.enroll("pc", ["api"])
+                self.assertTrue(api_devices_exist())
+            finally:
+                security_mod.registry = old
 
     def test_zip_paths_stay_inside_destination(self):
         destination = Path("C:/Titan/exports")

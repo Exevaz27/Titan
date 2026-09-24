@@ -10,6 +10,14 @@
     "nombre": "Titán",
     "idioma": "es-AR",
     "palabras_clave": [
+      "titán",
+      "titan",
+      "che titán",
+      "che titan",
+      "tita",
+      "titam",
+      "palermo",
+      "che palermo",
       "ehu titán",
       "ehu titan",
       "cuautitlán",
@@ -26,14 +34,6 @@
       "hola titan",
       "oye titán",
       "oye titan",
-      "titán",
-      "titan",
-      "tita",
-      "titam",
-      "che titán",
-      "che titan",
-      "palermo",
-      "che palermo",
       "che asistente",
       "asistente",
       "che gemini",
@@ -44,7 +44,9 @@
       "hey titán",
       "hey titan",
       "hey ti",
-      "che ti"
+      "che ti",
+      "ford",
+      "che ford"
     ]
   },
   "hotkey": {

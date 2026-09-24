@@ -120,6 +120,54 @@ class WebSocketHub:
             self.active_connections.discard(ws)
         return sent
 
+    async def send_rpc_to_satellites(self, base_payload: dict) -> bool:
+        """Envía un remote_exec firmando POR CONEXIÓN (P0-4).
+
+        Cada satélite tiene su propio token, así que el HMAC se calcula
+        por separado para cada conexión usando el token guardado al
+        registrarse durante el handshake P0-4 (auth_nonce).
+
+        Fail-closed: las conexiones SIN token guardado (satélites viejos
+        que no completaron el handshake de autenticación mutua) NO reciben
+        la orden. Un satélite viejo se conecta pero nunca ejecuta órdenes
+        remotas hasta actualizarse. Mandar sin firma sería fail-open: el
+        satélite viejo ejecutaría remote_exec sin autenticación mutua.
+        """
+        from core import rpc_auth
+        if not self.satellite_connections:
+            return False
+        sent = False
+        dead = set()
+        for ws in list(self.satellite_connections):
+            payload = dict(base_payload)
+            token = (self.connection_meta.get(ws) or {}).get("rpc_token", "")
+            if not token:
+                # P0-4 (fix fail-open): sin handshake mutuo verificado no se
+                # envía la orden. El satélite viejo queda conectado pero
+                # inoperable hasta actualizarse.
+                meta = (self.connection_meta.get(ws) or {})
+                log_warning(
+                    "[RPC] Orden NO enviada: satélite sin handshake P0-4 "
+                    f"(device_id={meta.get('device_id', '?')}). "
+                    "Actualizá el satélite para rehabilitar órdenes remotas."
+                )
+                continue
+            payload["hmac"] = rpc_auth.sign_remote_command(
+                token,
+                str(base_payload.get("request_id", "")),
+                str(base_payload.get("action", "")),
+                base_payload.get("args") if isinstance(base_payload.get("args"), dict) else {},
+            )
+            try:
+                await ws.send_text(json.dumps(payload, ensure_ascii=False))
+                sent = True
+            except Exception:
+                dead.add(ws)
+        for ws in dead:
+            self.satellite_connections.discard(ws)
+            self.active_connections.discard(ws)
+        return sent
+
     def resolve_rpc(self, request_id: str, result: dict):
         """Resuelve un Future RPC pendiente cuando el satélite responde."""
         fut = self._pending_rpc.pop(request_id, None)
@@ -150,7 +198,9 @@ class WebSocketHub:
             "request_id": request_id
         }
 
-        sent = await self.send_to_satellite(payload)
+        # P0-4 — Se firma por conexión (cada satélite verifica el HMAC con
+        # su token antes de ejecutar). Ver send_rpc_to_satellites.
+        sent = await self.send_rpc_to_satellites(payload)
         if not sent:
             self._pending_rpc.pop(request_id, None)
             return {
@@ -175,15 +225,18 @@ class WebSocketHub:
             return
 
         message = json.dumps(event, ensure_ascii=False)
-        disconnected = set()
-        for connection in list(self.active_connections):
-            try:
-                await connection.send_text(message)
-            except Exception:
-                disconnected.add(connection)
-
-        for dead_conn in disconnected:
-            self.active_connections.discard(dead_conn)
-            self.satellite_connections.discard(dead_conn)
+        targets = list(self.active_connections)
+        # F4: en paralelo, no secuencial — un cliente lento (backpressure TCP)
+        # no frena la entrega al resto. Los que fallen se podan del todo,
+        # incluida su connection_meta (antes quedaba colgada para siempre).
+        results = await asyncio.gather(
+            *(conn.send_text(message) for conn in targets),
+            return_exceptions=True,
+        )
+        for conn, res in zip(targets, results):
+            if isinstance(res, Exception):
+                self.active_connections.discard(conn)
+                self.satellite_connections.discard(conn)
+                self.connection_meta.pop(conn, None)
 
 ws_hub = WebSocketHub()

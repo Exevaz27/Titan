@@ -18,6 +18,58 @@ IGNORED_DIRS = {
     "appdata", "$recycle.bin", "system volume information", "windows"
 }
 
+
+def _is_windows_path(p: str) -> bool:
+    """Detecta rutas estilo Windows (C:\\... o \\\\servidor\\...) para delegarlas al satélite."""
+    p = p or ""
+    return (len(p) >= 3 and p[1] == ":" and p[2] in ("\\", "/")) or p.startswith("\\\\")
+
+
+# D-C: carpetas del sistema que Titán no puede tocar (ni leer, ni escribir, ni borrar).
+# Todo lo demás está permitido; borrar/mover archivos personales siguen pidiendo
+# confirmación por la política de confirmaciones (P0-3).
+_BLOCKED_WINDOWS = ("c:\\windows",)
+_BLOCKED_LINUX = ("/etc", "/sys", "/proc", "/boot")
+
+
+def _blocked_reason(path: str) -> Optional[str]:
+    """Devuelve el motivo si la ruta cae dentro de una carpeta del sistema bloqueada, o None.
+
+    En la DDR3 las rutas Windows se evalúan con la lista Windows ANTES de delegar
+    al satélite; en el satélite (os.name == 'nt') toda ruta se evalúa como Windows.
+    """
+    raw = (path or "").strip()
+    if not raw:
+        return None
+    if _is_windows_path(raw) or os.name == "nt":
+        low = raw.lower().replace("/", "\\")
+        if len(low) > 2 and low[1] == ":" and low[2] != "\\":
+            low = low[:2] + "\\" + low[2:]
+        if os.name == "nt" and not (low[1:2] == ":" or low.startswith("\\\\")):
+            # Ruta relativa en Windows: resolver contra el cwd real antes de comparar
+            low = os.path.abspath(low).lower().replace("/", "\\")
+        for blocked in _BLOCKED_WINDOWS:
+            if low == blocked or low.startswith(blocked + "\\"):
+                return "carpeta del sistema Windows (bloqueada por seguridad)"
+        return None
+    p = os.path.abspath(os.path.expanduser(raw))
+    for blocked in _BLOCKED_LINUX:
+        if p == blocked or p.startswith(blocked + "/"):
+            return "carpeta del sistema Linux (bloqueada por seguridad)"
+    return None
+
+
+def _deny_if_blocked(*paths: str) -> Optional[Dict[str, Any]]:
+    """Helper D-C: si alguna ruta está bloqueada devuelve el dict de error; si no, None."""
+    for p in paths:
+        reason = _blocked_reason(p)
+        if reason:
+            msg = f"Che, no puedo tocar '{p}': es {reason}."
+            log_warning(f"[D-C] Ruta bloqueada: {p}")
+            return {"status": "error", "message": msg}
+    return None
+
+
 class FileManager:
     def _remote_exec_if_linux(self, action: str, args: dict, success_msg: str) -> Optional[Dict[str, Any]]:
         """Si corre en Linux (servidor DDR3), delega la acción al satélite Windows conectado vía WebSocket RPC bidireccional."""
@@ -60,6 +112,9 @@ class FileManager:
 
     def search_files(self, query: str, extension: Optional[str] = None, location: Optional[str] = None, max_results: int = 10) -> Dict[str, Any]:
         """Busca archivos por nombre o extensión en las carpetas y discos configurados"""
+        deny = _deny_if_blocked(location)
+        if deny:
+            return deny
         if os.name != 'nt':
             remote_res = self._remote_exec_if_linux(
                 "search_files",
@@ -107,7 +162,10 @@ class FileManager:
                         continue
 
                     # Filtrar carpetas ignoradas para que no tarde una eternidad
-                    dirs[:] = [d for d in dirs if d.lower() not in IGNORED_DIRS and not d.startswith(".")]
+                    # D-C: también podar carpetas del sistema bloqueadas
+                    dirs[:] = [d for d in dirs
+                               if d.lower() not in IGNORED_DIRS and not d.startswith(".")
+                               and not _blocked_reason(str(Path(root) / d))]
 
                     for f in files:
                         f_lower = f.lower()
@@ -141,6 +199,9 @@ class FileManager:
 
     def open_file(self, file_path: str) -> Dict[str, Any]:
         """Abre un archivo con el programa predeterminado de Windows"""
+        deny = _deny_if_blocked(file_path)
+        if deny:
+            return deny
         if os.name != 'nt':
             remote_res = self._remote_exec_if_linux(
                 "open_file",
@@ -169,6 +230,9 @@ class FileManager:
 
     def show_in_folder(self, file_path: str) -> Dict[str, Any]:
         """Abre el explorador de Windows seleccionando el archivo indicado"""
+        deny = _deny_if_blocked(file_path)
+        if deny:
+            return deny
         if os.name != 'nt':
             remote_res = self._remote_exec_if_linux(
                 "show_in_folder",
@@ -192,6 +256,9 @@ class FileManager:
 
     def trash_file(self, file_path: str) -> Dict[str, Any]:
         """Envía el archivo a la papelera de reciclaje de Windows de forma segura"""
+        deny = _deny_if_blocked(file_path)
+        if deny:
+            return deny
         if os.name != 'nt':
             remote_res = self._remote_exec_if_linux(
                 "trash_file",
@@ -219,6 +286,9 @@ class FileManager:
 
     def move_file(self, source: str, destination: str) -> Dict[str, Any]:
         """Mueve un archivo o carpeta a otra ubicación"""
+        deny = _deny_if_blocked(source, destination)
+        if deny:
+            return deny
         src = Path(source)
         dst = Path(destination)
         if not src.exists():
@@ -235,6 +305,9 @@ class FileManager:
 
     def copy_file(self, source: str, destination: str) -> Dict[str, Any]:
         """Copia un archivo a otra ubicación"""
+        deny = _deny_if_blocked(source, destination)
+        if deny:
+            return deny
         src = Path(source)
         dst = Path(destination)
         if not src.exists():
@@ -250,6 +323,20 @@ class FileManager:
 
     def read_file_content(self, file_path: str, max_chars: int = 3000) -> Dict[str, Any]:
         """Lee el contenido de un archivo de texto, código, markdown, csv, json"""
+        deny = _deny_if_blocked(file_path)
+        if deny:
+            return deny
+        # En el servidor Linux (DDR3), las rutas de Windows (C:\... o \\...)
+        # se leen en la PC vía satélite RPC. Antes este método no delegaba:
+        # buscaba el archivo de la PC en el disco de la DDR3 y fallaba siempre.
+        if os.name != 'nt' and _is_windows_path(file_path):
+            remote_res = self._remote_exec_if_linux(
+                "read_file_content",
+                {"file_path": file_path, "max_chars": max_chars},
+                f"Leyendo el contenido de '{file_path}' en Windows..."
+            )
+            if remote_res:
+                return remote_res
         p = Path(file_path)
         if not p.exists():
             return {"status": "error", "message": f"No encuentro el archivo '{file_path}'."}
@@ -291,17 +378,37 @@ class FileManager:
             return target
         return user_home / folder_name
 
+    def resolve_create_target(self, filename: str, folder: str = "Desktop") -> Path:
+        """Resuelve la ruta destino de create_file SIN crear nada.
+
+        Para pre-chequeos (ej: la política de confirmaciones pregunta solo
+        si el archivo ya existe y se va a pisar)."""
+        p_file = Path(filename)
+        if p_file.is_absolute():
+            return p_file
+        return self._resolve_folder(folder) / filename
+
+    def resolve_copy_target(self, source: str, destination: str) -> Path:
+        """Resuelve el destino real de copy_file (si destination es una
+        carpeta existente, el archivo entra con el mismo nombre).
+
+        Para pre-chequeos de sobreescritura."""
+        src = Path(source)
+        dst = Path(destination)
+        if dst.is_dir():
+            return dst / src.name
+        return dst
+
     def create_file(self, filename: str, content: str = "", folder: str = "Desktop") -> Dict[str, Any]:
         """Crea un archivo nuevo con el contenido dado en la carpeta indicada (por defecto Escritorio)"""
         try:
-            p_file = Path(filename)
-            if p_file.is_absolute():
-                target_path = p_file
-            else:
-                base_dir = self._resolve_folder(folder)
-                base_dir.mkdir(parents=True, exist_ok=True)
-                target_path = base_dir / filename
+            target_path = self.resolve_create_target(filename, folder)
+            if not Path(filename).is_absolute():
+                target_path.parent.mkdir(parents=True, exist_ok=True)
 
+            deny = _deny_if_blocked(str(target_path))
+            if deny:
+                return deny
             target_path.parent.mkdir(parents=True, exist_ok=True)
             with open(target_path, "w", encoding="utf-8") as f:
                 f.write(content)
@@ -330,6 +437,10 @@ class FileManager:
 
             if not target_path or not target_path.exists():
                 return {"status": "error", "message": f"No encontré el archivo '{filename}' para agregar contenido."}
+
+            deny = _deny_if_blocked(str(target_path))
+            if deny:
+                return deny
 
             with open(target_path, "a", encoding="utf-8") as f:
                 f.write("\n" + content if target_path.stat().st_size > 0 else content)
@@ -367,6 +478,10 @@ class FileManager:
             else:
                 dest_dir = target_zip.parent / target_zip.stem
 
+            deny = _deny_if_blocked(str(target_zip), str(dest_dir))
+            if deny:
+                return deny
+
             dest_dir.mkdir(parents=True, exist_ok=True)
             with zipfile.ZipFile(target_zip, 'r') as zip_ref:
                 for member in zip_ref.infolist():
@@ -388,8 +503,22 @@ class FileManager:
 
     def organize_folder(self, folder_name: str = "Downloads") -> Dict[str, Any]:
         """Organiza automáticamente los archivos de una carpeta (por defecto Descargas) en subcarpetas por categoría"""
+        # Como las demás acciones de archivos: si corre en la DDR3, se
+        # delega al satélite Windows (si no, resolvería ~/Downloads local
+        # en la DDR3 y fallaría con "no existe").
+        if os.name != 'nt':
+            remote_res = self._remote_exec_if_linux(
+                "organize_folder",
+                {"folder_name": folder_name},
+                f"Organizando '{folder_name}' en la compu..."
+            )
+            if remote_res:
+                return remote_res
         try:
             target_dir = self._resolve_folder(folder_name)
+            deny = _deny_if_blocked(str(target_dir))
+            if deny:
+                return deny
             if not target_dir.exists() or not target_dir.is_dir():
                 return {"status": "error", "message": f"La carpeta '{folder_name}' no existe o no es un directorio válido."}
 
@@ -400,7 +529,8 @@ class FileManager:
                 "Comprimidos": {".zip", ".rar", ".7z", ".tar", ".gz"},
                 "Música": {".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a"},
                 "Videos": {".mp4", ".mkv", ".avi", ".mov", ".flv", ".wmv"},
-                "Código": {".py", ".js", ".ts", ".html", ".css", ".json", ".cpp", ".c", ".rs", ".java", ".sql"}
+                "Código": {".py", ".js", ".ts", ".html", ".css", ".json", ".cpp", ".c", ".rs", ".java", ".sql"},
+                "Modelos 3D": {".stl", ".3mf", ".obj", ".amf", ".step", ".stp"}
             }
 
             EXT_MAP = {}

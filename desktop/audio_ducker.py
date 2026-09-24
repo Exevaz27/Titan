@@ -1,5 +1,6 @@
 import os
 import time
+import json
 import threading
 import subprocess
 from core.logger import log_info, log_warning
@@ -12,9 +13,33 @@ class AudioDucker:
         self.timeout_failsafe = timeout_failsafe
         self._is_ducked = False
         self._saved_master_volume = None
+        self._saved_spotify_volume = None
         self._lock = threading.Lock()
         self._cli_path = os.path.expandvars(r"%APPDATA%\Spotify\spotify_cli.exe")
         self._failsafe_timer: threading.Timer = None
+
+    def _read_spotify_volume(self):
+        """R-13: lee el volumen real de Spotify (0.0-1.0) antes de atenuar.
+        Retorna None si no se puede determinar."""
+        try:
+            res = run_silent(
+                [self._cli_path, "devices", "--format", "json"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=1.0,
+            )
+            if res.stdout:
+                data = json.loads(res.stdout)
+                for d in data.get("devices", []):
+                    if d.get("is_active") or d.get("is_self"):
+                        v = d.get("volume")
+                        if v is not None:
+                            return max(0.0, min(1.0, float(v) / 100.0))
+        except Exception:
+            pass
+        return None
 
     def duck(self, target_percent: int = None):
         """Atenúa la música / audio general de Windows a un volumen bajo (por defecto 15%)"""
@@ -35,6 +60,10 @@ class AudioDucker:
 
                 if os.path.exists(self._cli_path):
                     try:
+                        # R-13: guardar el volumen REAL de Spotify antes de
+                        # atenuar, para restaurarlo después (antes se
+                        # restauraba un 0.8 fijo, ignorando el volumen previo).
+                        self._saved_spotify_volume = self._read_spotify_volume()
                         run_silent(
                             [self._cli_path, "volume", str(target / 100.0)],
                             capture_output=True,
@@ -63,8 +92,12 @@ class AudioDucker:
 
                 if os.path.exists(self._cli_path):
                     try:
+                        # R-13: restaurar el volumen previo real; 0.8 solo como
+                        # último recurso si no se pudo leer al atenuar.
+                        restore_vol = self._saved_spotify_volume if self._saved_spotify_volume is not None else 0.8
+                        self._saved_spotify_volume = None
                         run_silent(
-                            [self._cli_path, "volume", "0.8"],
+                            [self._cli_path, "volume", str(restore_vol)],
                             capture_output=True,
                             timeout=0.6
                         )
@@ -75,6 +108,47 @@ class AudioDucker:
 
             except Exception as e:
                 log_warning(f"[Audio Ducking] Error al restaurar volumen: {e}")
+
+    def is_media_active(self) -> bool:
+        """B-11: True si hay audio saliendo por los parlantes de la PC
+        (música, YouTube, juegos). La DDR3 lo consulta por RPC porque en
+        Linux pycaw no existe."""
+        # 1. Pico del medidor de los parlantes (pycaw, Windows)
+        try:
+            import comtypes
+            comtypes.CoInitialize()
+            try:
+                from pycaw.pycaw import AudioUtilities, IAudioMeterInformation
+                from comtypes import CLSCTX_ALL
+                device = AudioUtilities.GetSpeakers()
+                if device and device._dev:
+                    meter = device._dev.Activate(
+                        IAudioMeterInformation._iid_, CLSCTX_ALL, None
+                    ).QueryInterface(IAudioMeterInformation)
+                    if float(meter.GetPeakValue()) > 0.035:
+                        return True
+            finally:
+                comtypes.CoUninitialize()
+        except Exception:
+            pass
+        # 2. Spotify sonando aunque el pico esté momentáneamente bajo
+        try:
+            if os.path.exists(self._cli_path):
+                res = run_silent(
+                    [self._cli_path, "now-playing", "--format", "json"],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=1.0,
+                )
+                if res.stdout:
+                    data = json.loads(res.stdout)
+                    if data.get("currently_playing", {}).get("is_playing"):
+                        return True
+        except Exception:
+            pass
+        return False
 
     def _reset_failsafe(self):
         self._cancel_failsafe()

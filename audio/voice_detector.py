@@ -25,6 +25,11 @@ def detect_speaker(pcm_bytes: bytes, sample_rate: int = 16000) -> Tuple[str, Opt
     # 1. Remuestreo/Decimación a ~16kHz si la frecuencia de entrada es 44.1k o 48k
     target_sr = 16000
     if sample_rate > 20000:
+        # 1a. Anti-alias ANTES de diezmar (2026-09-15): sin este pasa-bajos,
+        # los tonos ultrasónicos (fuentes switching, backlights, ~16-17 kHz)
+        # se pliegan a la banda vocal al diezmar y falsean la detección.
+        aa_kernel = np.ones(9, dtype=np.float32) / 9.0
+        samples = np.convolve(samples, aa_kernel, mode="same")
         step = int(round(sample_rate / target_sr))
         samples = samples[::step]
         actual_sr = float(sample_rate / step)
@@ -33,6 +38,15 @@ def detect_speaker(pcm_bytes: bytes, sample_rate: int = 16000) -> Tuple[str, Opt
 
     if len(samples) < 1024:
         return "hombre", None
+
+    # 1b. Filtro peine anti-hum de red (2026-09-15): y[n] = x[n] - x[n-K] con
+    # K = sr/50 pone nulos en 50, 100, 150... Hz. Los mics baratos suelen
+    # captar zumbido eléctrico de la red; como el rango de búsqueda (75-380 Hz)
+    # excluye los 50 Hz pero no sus armónicos, el detector se enganchaba de
+    # esos armónicos y clasificaba mal (p. ej. "niño" a 386.8 Hz).
+    k_hum = max(1, int(round(actual_sr / 50.0)))
+    if len(samples) > k_hum:
+        samples = samples[k_hum:] - samples[:-k_hum]
 
     # 2. Filtro pasa-bajos simple (media móvil de 5 muestras) para atenuar armónicos altos
     # y evitar que los formantes de 300-800 Hz superen la frecuencia fundamental en micrófonos baratos
@@ -72,6 +86,12 @@ def detect_speaker(pcm_bytes: bytes, sample_rate: int = 16000) -> Tuple[str, Opt
         best_idx = int(np.argmax(sub))
         best_val = sub[best_idx]
         lag = min_lag + best_idx
+
+        # Un pico justo en el borde del rango de búsqueda es artefacto
+        # (ruido de banda ancha/tonos fuera de rango), no un pitch real:
+        # se descarta la ventana en vez de informar un pitch falso.
+        if lag == min_lag or lag == max_lag - 1:
+            continue
 
         # Umbral de periodicidad mínima (autocorrelación normalizada)
         if best_val > 0.32 and lag > 0:

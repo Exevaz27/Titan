@@ -27,13 +27,94 @@ POWER_PLANS = {
     "performance": {"guid": "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c", "name": "Alto rendimiento", "desc": "Máxima potencia para juegos y edición"}
 }
 
+# DIAG 2026-09-15: cronometra las herramientas de fútbol/búsqueda para
+# diagnosticar la latencia. Solo escribe en el log, no cambia comportamiento.
+import functools
+
+def _timed(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        t0 = time.time()
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            log_info(f"[TIMING] {fn.__qualname__} tardó {time.time() - t0:.1f}s")
+    return wrapper
+
+
 class SystemControl:
+    # Mapa de equipos -> ID de FotMob (descubiertos 2026-09-15).
+    # FotMob no tiene búsqueda por nombre usable, así que cada equipo se registra una vez.
+    # Formato: (id_fotmob, nombre_para_mostrar, clave_corta_para_detectar_localia, [alias_en_minusculas_sin_acentos])
+    FOTMOB_TEAMS = [
+        (10077, "Boca Juniors", "Boca", ["boca", "boca juniors", "xeneize", "xeneizes"]),
+        (10076, "River Plate", "River", ["river", "river plate", "millonario", "millonarios"]),
+        (10080, "Racing Club", "Racing", ["racing", "racing club", "academia"]),
+        (10078, "Independiente", "Independiente", ["independiente", "rojo", "diablo"]),
+        (10083, "San Lorenzo", "San Lorenzo", ["san lorenzo", "casla", "ciclon"]),
+        (10079, "Vélez Sarsfield", "Vélez", ["velez", "velez sarsfield", "fortin"]),
+        (10081, "Huracán", "Huracán", ["huracan", "globo"]),
+        (10082, "Lanús", "Lanús", ["lanus", "granate"]),
+        (10084, "Rosario Central", "Rosario Central", ["rosario central", "central", "canalla", "canallas"]),
+        (10086, "Argentinos Juniors", "Argentinos", ["argentinos", "argentinos juniors", "bicho"]),
+        (10087, "Banfield", "Banfield", ["banfield", "taladro"]),
+        (10088, "Colón", "Colón", ["colon", "sabalero"]),
+        (10089, "Platense", "Platense", ["platense", "calamar"]),
+        (10090, "Instituto", "Instituto", ["instituto", "gloria"]),
+        (10092, "Belgrano", "Belgrano", ["belgrano", "pirata", "celeste"]),
+        (10093, "Chacarita Juniors", "Chacarita", ["chacarita", "funebrero"]),
+        (10094, "Estudiantes", "Estudiantes", ["estudiantes", "pincha", "pincharrata"]),
+        (10085, "Atlético Rafaela", "Rafaela", ["rafaela", "atletico rafaela"]),
+        (10091, "Nueva Chicago", "Nueva Chicago", ["nueva chicago", "chicago", "torito"]),
+        (10095, "Gimnasia Jujuy", "Gimnasia", ["gimnasia jujuy", "gimnasia de jujuy", "lobo jujeno"]),
+    ]
+    # Índice alias -> (id, display, match_key), con alias largos primero para que
+    # "rosario central" gane sobre "central".
+    _FOTMOB_ALIAS_INDEX = None
+
+    @classmethod
+    def _fotmob_alias_index(cls):
+        if cls._FOTMOB_ALIAS_INDEX is None:
+            idx = {}
+            for tid, display, mkey, aliases in cls.FOTMOB_TEAMS:
+                for a in aliases:
+                    idx[a] = (tid, display, mkey)
+            cls._FOTMOB_ALIAS_INDEX = idx
+        return cls._FOTMOB_ALIAS_INDEX
+
+    @classmethod
+    def match_fotmob_team(cls, query: str):
+        """Devuelve (id, display, match_key) del equipo de FotMob mencionado en la consulta,
+        o None si no hay ninguno mapeado. Insensible a acentos y mayúsculas."""
+        import unicodedata
+        q = unicodedata.normalize("NFKD", query or "")
+        q = "".join(c for c in q if not unicodedata.combining(c)).lower()
+        best = None
+        for alias, info in cls._fotmob_alias_index().items():
+            if alias in q:
+                if best is None or len(alias) > len(best[0]):
+                    best = (alias, info)
+        return best[1] if best else None
+
     def __init__(self):
         self._volume_interface = None
         self.max_session_temp: float = 0.0
         self.last_temp: Optional[float] = None
         self.thermal_alert_threshold: float = 80.0
+        # B-26: bandera real de voz de Titán en la PC (antes la rama Windows
+        # devolvía "comando recibido" sin tocar nada).
+        self.pc_voice_enabled = False
         self._init_audio()
+        # B-27: "priming" de psutil. cpu_percent(interval=None) compara contra
+        # la llamada anterior; la primera siempre da 0.0 (sin muestra previa).
+        # Se establece la línea base acá para que get_system_metrics devuelva
+        # valores reales desde la primera telemetría (ambas variantes: global
+        # y por núcleo, que psutil trackea por separado).
+        try:
+            psutil.cpu_percent(interval=None)
+            psutil.cpu_percent(interval=None, percpu=True)
+        except Exception:
+            pass
 
     def _init_audio(self):
         try:
@@ -138,7 +219,9 @@ class SystemControl:
             if remote_res:
                 return remote_res
             return {"status": "warning", "message": "El satélite en Windows no está conectado."}
-        return {"status": "success", "message": "Comando recibido en Windows."}
+        # H-5: delega en set_pc_voice para no duplicar la lógica local
+        # (el punto de entrada se conserva: lo usa el botón del HUD y el RPC).
+        return self.set_pc_voice(not self.pc_voice_enabled)
 
     def set_pc_voice(self, enabled: bool) -> Dict[str, Any]:
         """Establece explícitamente si la voz de Titán sale por la PC Principal Windows"""
@@ -147,7 +230,12 @@ class SystemControl:
             if remote_res:
                 return remote_res
             return {"status": "warning", "message": "El satélite en Windows no está conectado."}
-        return {"status": "success", "message": "Comando recibido en Windows."}
+        # B-26: éxito real — antes devolvía "Comando recibido en Windows" sin hacer nada.
+        self.pc_voice_enabled = bool(enabled)
+        st = "activada" if self.pc_voice_enabled else "silenciada"
+        msg = f"Voz de Titán en la PC Principal {st}."
+        state_mgr.emit_tool_call("set_pc_voice", {"enabled": enabled}, msg)
+        return {"status": "success", "enabled": self.pc_voice_enabled, "message": msg}
 
 
     def _remote_exec_if_linux(self, action: str, args: dict, success_msg: str) -> Optional[Dict[str, Any]]:
@@ -267,14 +355,10 @@ class SystemControl:
             except Exception:
                 pass
 
-        if exe_path and os.path.exists(exe_path):
-            # Lanzamiento interactivo mediante schtasks sin abrir ventana de consola
-            task_name = "TitanSpotifyLaunch"
-            run_silent(["schtasks", "/create", "/tn", task_name, "/tr", f'"{exe_path}"', "/sc", "once", "/st", "23:59", "/f", "/it"], capture_output=True)
-            run_silent(["schtasks", "/run", "/tn", task_name], capture_output=True)
-            time.sleep(1.0)
-            run_silent(["schtasks", "/delete", "/tn", task_name, "/f"], capture_output=True)
-
+        # B-28: antes se creaba una tarea schtasks programada a las 23:59 para
+        # lanzar Spotify (frágil: depende del Programador de tareas y de una
+        # hora arbitraria). Ahora lanzamiento directo con Popen, probado en B-5.
+        if self._launch_spotify_exe():
             if cli_path:
                 for _ in range(12):
                     time.sleep(0.4)
@@ -289,6 +373,29 @@ class SystemControl:
                 time.sleep(1.5)
                 self._bring_spotify_window_to_front()
                 return True
+        return False
+
+    def _launch_spotify_exe(self) -> bool:
+        """Lanza el ejecutable de Spotify directamente.
+
+        B-5: NO usar app_launcher aquí. El método no existe como
+        ``app_launcher.launch`` (es ``launch_app``) y llamarlo de todos
+        modos causaría recursión infinita: launch_app("spotify") reentra
+        a system_control.play_spotify("").
+        """
+        exe_path = self._get_spotify_exe_path()
+        if exe_path and os.path.exists(exe_path):
+            try:
+                subprocess.Popen(
+                    [exe_path],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                log_info(f"[Spotify] Lanzado directamente: {exe_path}")
+                return True
+            except Exception as e:
+                log_warning(f"[Spotify] No se pudo lanzar {exe_path}: {e}")
         return False
 
 
@@ -410,12 +517,13 @@ class SystemControl:
                     raw_info = lines[0] if lines else ""
                     # Quitar el URI si está al final
                     clean_info = raw_info.split("spotify:")[0].strip()
-                    if "—" in clean_info:
-                        parts = clean_info.split("—")
-                        track_info = f"'{parts[0].strip()}' de {parts[1].strip()}"
-                    elif "-" in clean_info:
-                        parts = clean_info.split("-")
-                        track_info = f"'{parts[0].strip()}' de {parts[1].strip()}"
+                    # B-19: partir solo por el PRIMER separador (con espacios
+                    # primero). Antes split("-") cortaba por todos los guiones
+                    # y "AC-DC - Back In Black" quedaba "'AC' de DC".
+                    sep = next((c for c in (" — ", " - ", "—", "-") if c in clean_info), None)
+                    if sep:
+                        title, artist = (p.strip() for p in clean_info.split(sep, 1))
+                        track_info = f"'{title}' de {artist}" if artist else f"'{title}'"
                     else:
                         track_info = clean_info or "música en Spotify"
 
@@ -470,6 +578,9 @@ class SystemControl:
         elif not filename.lower().endswith(".png"):
             filename += ".png"
 
+        # B-21: el nombre puede venir de afuera (herramienta de Gemini); reducirlo
+        # al nombre base para que un "../" no escriba fuera de la carpeta de capturas.
+        filename = Path(filename.replace("\\", "/")).name
         target_path = pictures_dir / filename
         # 1. Intentar con Pillow (más rápido y directo)
         try:
@@ -554,29 +665,60 @@ class SystemControl:
 
         else:
             # Linux (DDR3 / Ubuntu)
+            # B-31: antes se iteraba en orden de dict y cualquier sensor
+            # posterior cuyo nombre matcheaba una keyword pisaba al anterior
+            # (el break solo salía del loop interno), así un sensor erróneo
+            # podía quedar como temperatura definitiva. Ahora: dos pasadas,
+            # primero sensores de CPU reales (k10temp/coretemp/...), después
+            # cualquier otro válido como último recurso.
+            def _temp_ok(entry):
+                return bool(entry.current) and 0 < entry.current < 125
+
+            def _is_cpu_sensor(name):
+                n = (name or "").lower()
+                return any(k in n for k in ("k10temp", "coretemp", "cpu", "package"))
+
             try:
-                st = getattr(psutil, "sensors_temperatures", lambda: {})()
-                if st:
+                st = getattr(psutil, "sensors_temperatures", lambda: {})() or {}
+                for prefer_cpu in (True, False):
                     for sname, slist in st.items():
+                        if _is_cpu_sensor(sname) != prefer_cpu:
+                            continue
                         for entry in slist:
-                            if entry.current and 0 < entry.current < 125:
-                                if res["cpu"] is None or any(k in sname.lower() for k in ["k10temp", "core", "cpu", "package"]):
-                                    res["cpu"] = round(entry.current, 1)
-                                    break
+                            if _temp_ok(entry):
+                                res["cpu"] = round(entry.current, 1)
+                                break
+                        if res["cpu"] is not None:
+                            break
+                    if res["cpu"] is not None:
+                        break
             except Exception:
                 pass
 
             if res["cpu"] is None:
                 try:
                     import glob
+                    cands = []
                     for f in glob.glob("/sys/class/hwmon/hwmon*/temp*_input"):
-                        with open(f, "r") as fp:
-                            raw = fp.read().strip()
+                        name = ""
+                        try:
+                            with open(os.path.join(os.path.dirname(f), "name")) as fp:
+                                name = fp.read().strip()
+                        except Exception:
+                            pass
+                        cands.append((_is_cpu_sensor(name), f))
+                    # Primero drivers de CPU, después el resto (orden estable)
+                    for _, f in sorted(cands, key=lambda x: (not x[0], x[1])):
+                        try:
+                            with open(f, "r") as fp:
+                                raw = fp.read().strip()
                             if raw.isdigit():
                                 val = round(float(raw) / 1000.0, 1)
                                 if 0 < val < 125:
                                     res["cpu"] = val
                                     break
+                        except Exception:
+                            continue
                 except Exception:
                     pass
 
@@ -698,6 +840,24 @@ class SystemControl:
         }
 
     def get_system_metrics(self) -> Dict[str, Any]:
+        """Obtiene métricas completas de CPU, núcleos, RAM, discos, red y temperatura para telemetría.
+
+        B-17: nunca revienta. Si alguna sub-llamada falla (WMI/servicio caído,
+        psutil sin permiso, etc.), devuelve un dict degradado con status=error
+        en vez de propagar la excepción: antes eso mataba el loop de telemetría
+        del satélite y dejaba de reportar por completo.
+        """
+        try:
+            return self._get_system_metrics_inner()
+        except Exception as e:
+            return {
+                "status": "error",
+                "hostname": os.getenv("COMPUTERNAME") or socket.gethostname(),
+                "platform": "windows" if sys.platform == "win32" else "linux",
+                "error": f"get_system_metrics falló: {e}",
+            }
+
+    def _get_system_metrics_inner(self) -> Dict[str, Any]:
         """Obtiene métricas completas de CPU, núcleos, RAM, discos, red y temperatura para telemetría"""
         cpu_percent = psutil.cpu_percent(interval=None)
         per_cpu = psutil.cpu_percent(interval=None, percpu=True)
@@ -768,10 +928,16 @@ class SystemControl:
                 pass
 
         hostname = os.getenv("COMPUTERNAME") or socket.gethostname()
+        # B-17: uptime del sistema (segundos desde el arranque), con guardia.
+        try:
+            uptime_s = int(time.time() - psutil.boot_time())
+        except Exception:
+            uptime_s = 0
         return {
             "status": "success",
             "hostname": hostname,
             "platform": "windows" if sys.platform == "win32" else "linux",
+            "uptime_s": uptime_s,
             "cpu_percent": cpu_percent,
             "per_cpu": per_cpu,
             "cpu_freq_ghz": cpu_freq_ghz,
@@ -811,12 +977,19 @@ class SystemControl:
         state_mgr.emit_tool_call("switch_screen_view", {"view": target}, msg)
         return {"status": "success", "message": msg, "active_view": target}
 
-    def set_inactivity_stage(self, stage: str) -> Dict[str, Any]:
-        """Cambia la etapa de reposo/animación en la pantalla del celular / HUD: 'mate', 'drowsy', 'sleeping', 'wake', 'idle'"""
+    def set_inactivity_stage(self, stage: str, drink: str = None) -> Dict[str, Any]:
+        """Cambia la etapa de reposo/animación en la pantalla del celular / HUD: 'mate', 'bebidas', 'drowsy', 'sleeping', 'wake', 'idle'.
+
+        drink: en 'bebidas', "fernet"|"birra"|"vino" (lo elige el J2 al azar si no se pasa).
+        FIX 2026-09-23 (modo bebidas).
+        """
         s = stage.lower().strip()
-        state_mgr.emit_stage(s)
+        state_mgr.emit_stage(s, drink)
         if s == "mate":
             msg = "¡De una, fiera! Pongo la pava al fuego y me clavo unos buenos mates."
+        elif s == "bebidas":
+            d = state_mgr.current_drink or "algo"
+            msg = f"¡De una, fiera! Me destapo {d} bien de barrio, del pico."
         elif s == "sleeping":
             msg = "Buenas noches, hermano. Descanso un rato los circuitos, cualquier cosa chiflame."
         elif s == "wake":
@@ -867,19 +1040,30 @@ class SystemControl:
         }
         
         c_clean = city.lower().strip()
-        lat, lon = coords.get(c_clean, (-34.6118, -58.4173))
-        
-        if c_clean not in coords:
+        # B-20: antes, si la ciudad no estaba en el diccionario y el geocoding
+        # fallaba, se seguía con las coords de Buenos Aires pero el mensaje
+        # decía "En {city}...": mentía con confianza. Ahora el nombre que se
+        # informa es siempre el de las coordenadas que se usaron, y si no se
+        # pudo ubicar la ciudad se devuelve un error honesto.
+        resolved_name = city.strip() or "Buenos Aires"
+        lat, lon = coords.get(c_clean, (None, None))
+
+        if lat is None:
             try:
-                geo_url = f"https://geocoding-api.open-meteo.com/v1/search?name={urllib.parse.quote(city)}&count=1&language=es&format=json"
+                geo_url = f"https://geocoding-api.open-meteo.com/v1/search?name={urllib.parse.quote(city.strip())}&count=1&language=es&format=json"
                 req = urllib.request.Request(geo_url, headers={'User-Agent': 'CheAsistente/1.0'})
                 with urllib.request.urlopen(req, timeout=3) as resp:
                     geo_data = json.loads(resp.read().decode('utf-8'))
-                    if geo_data.get("results"):
-                        lat = geo_data["results"][0]["latitude"]
-                        lon = geo_data["results"][0]["longitude"]
+                    results = geo_data.get("results") or []
+                    if not results:
+                        return {"status": "error",
+                                "message": f"No encontré ninguna ciudad llamada '{city.strip()}'. ¿Me la repetís?"}
+                    lat = results[0]["latitude"]
+                    lon = results[0]["longitude"]
+                    resolved_name = results[0].get("name") or resolved_name
             except Exception:
-                pass
+                return {"status": "error",
+                        "message": f"No pude ubicar '{city.strip()}' para el clima (falló la búsqueda). Probá de nuevo en un rato."}
 
         try:
             url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current_weather=true"
@@ -898,9 +1082,9 @@ class SystemControl:
                 elif code in [80, 81, 82]: desc = "con chaparrones"
                 elif code in [95, 96, 99]: desc = "con tormenta eléctrica"
 
-                msg = f"En {city.capitalize()} tenemos {temp} grados, {desc}, y viento a {wind} kilómetros por hora."
-                state_mgr.emit_tool_call("get_weather", {"city": city}, msg)
-                return {"status": "success", "city": city, "temperature": temp, "description": desc, "wind_speed": wind, "message": msg}
+                msg = f"En {resolved_name} tenemos {temp} grados, {desc}, y viento a {wind} kilómetros por hora."
+                state_mgr.emit_tool_call("get_weather", {"city": resolved_name}, msg)
+                return {"status": "success", "city": resolved_name, "temperature": temp, "description": desc, "wind_speed": wind, "message": msg}
         except Exception as e:
             return {"status": "error", "message": f"No pude consultar el clima: {e}"}
 
@@ -995,6 +1179,7 @@ class SystemControl:
                 return league, date_str
         return None, None
 
+    @_timed
     def get_soccer_match_sheet(self, team_query: str = "Boca", target_date = None, specific_league: str = None) -> str:
         """Obtiene la ficha técnica oficial de ESPN (resultado, goles, 11 titular oficial y suplentes) para cualquier equipo o final histórica."""
         import urllib.request
@@ -1199,13 +1384,34 @@ class SystemControl:
             "days_diff": days_diff
         }
 
+    @_timed
     def _get_fotmob_boca_data(self) -> Dict[str, Any]:
-        """Extrae de FotMob en tiempo real (vía SSR Next.js __NEXT_DATA__) el próximo partido y último partido."""
+        """Wrapper legacy: datos de Boca con la MISMA técnica y formato de siempre.
+        No cambiar su comportamiento: es el camino probado en producción."""
+        return self._get_fotmob_team_data(10077, "Boca", home_stadium="en La Bombonera",
+                                          slug="boca-juniors")
+
+    def _get_fotmob_team_data(self, team_id: int, team_name: str,
+                              home_stadium: str = "", slug: str = "x") -> Dict[str, Any]:
+        """Extrae de FotMob en tiempo real (vía SSR Next.js __NEXT_DATA__) el próximo partido,
+        último partido, fixture reciente Y agenda futura de CUALQUIER equipo mapeado.
+        Misma técnica que el fetcher original de Boca; solo se parametriza el equipo.
+        FIX 2026-09-15: además de recent_fixtures extrae upcoming_fixtures (partidos con
+        notStarted=true, ordenados por fecha, hora ya convertida a Argentina): es la
+        fuente para 'el partido después del de hoy' / 'el del finde'. Viene en la misma
+        página: cero pedidos HTTP extra."""
         import urllib.request
         import json
         import re
+        import unicodedata
 
-        url = "https://www.fotmob.com/teams/10077/overview/boca-juniors"
+        def norm(s):
+            s = unicodedata.normalize("NFKD", s or "")
+            s = "".join(c for c in s if not unicodedata.combining(c))
+            return s.lower()
+
+        team_key = norm(team_name)
+        url = f"https://www.fotmob.com/teams/{team_id}/overview/{slug}"
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -1219,7 +1425,7 @@ class SystemControl:
             if not m:
                 return {}
             data = json.loads(m.group(1))
-            team_data = data.get('props', {}).get('pageProps', {}).get('fallback', {}).get('team-10077', {})
+            team_data = data.get('props', {}).get('pageProps', {}).get('fallback', {}).get(f'team-{team_id}', {})
             overview = team_data.get('overview', {})
             
             next_m = overview.get('nextMatch', {})
@@ -1229,9 +1435,12 @@ class SystemControl:
                 tz_conv = self._format_utc_to_argentina(utc)
                 home = next_m.get('home', {}).get('name', '')
                 away = next_m.get('away', {}).get('name', '')
-                is_home = "Boca" in home
+                is_home = team_key in norm(home)
                 rival = away if is_home else home
-                cond = "Local (en La Bombonera)" if is_home else f"Visitante (en cancha de {rival})"
+                if is_home:
+                    cond = f"Local ({home_stadium})" if home_stadium else "Local"
+                else:
+                    cond = f"Visitante (en cancha de {rival})"
                 tournament = next_m.get('tournament', {}).get('name', 'Torneo Oficial')
                 next_info = {
                     "id": next_m.get('id'),
@@ -1271,19 +1480,192 @@ class SystemControl:
                     "utc_time": utc
                 }
                 
+            # FIX 2026-09-15: lista de partidos recientes (para "la ida", "el 11 vs X", etc.).
+            # Viene en la misma página de FotMob: cero pedidos HTTP extra.
+            recent_fixtures = []
+            try:
+                all_fx = team_data.get('fixtures', {}).get('allFixtures', {}).get('fixtures', [])
+                for fx in all_fx:
+                    f_utc = fx.get('status', {}).get('utcTime', '')
+                    f_home = fx.get('home', {}).get('name', '')
+                    f_away = fx.get('away', {}).get('name', '')
+                    if not f_home or not f_away:
+                        continue
+                    f_is_home = team_key in norm(f_home)
+                    f_rival = f_away if f_is_home else f_home
+                    f_tz = self._format_utc_to_argentina(f_utc)
+                    f_hs = fx.get('home', {}).get('score', 0)
+                    f_as = fx.get('away', {}).get('score', 0)
+                    f_score = fx.get('status', {}).get('scoreStr', f"{f_hs} - {f_as}")
+                    recent_fixtures.append({
+                        "pageUrl": fx.get('pageUrl'),
+                        "home": f_home,
+                        "away": f_away,
+                        "rival": f_rival,
+                        "tournament": fx.get('tournament', {}).get('name', 'Torneo Oficial'),
+                        "utc_time": f_utc,
+                        "display_date": f_tz.get('display', ''),
+                        "score": f_score,
+                        "not_started": fx.get('notStarted', False),
+                    })
+            except Exception:
+                recent_fixtures = []
+
+            # FIX 2026-09-15: agenda futura (para "después del de hoy" / "el del finde").
+            # FotMob trae los próximos partidos con notStarted=true en el mismo fixture.
+            try:
+                upcoming_fixtures = sorted(
+                    [f for f in recent_fixtures if f.get("not_started") and f.get("utc_time")],
+                    key=lambda f: f["utc_time"],
+                )
+            except Exception:
+                upcoming_fixtures = []
+
             return {
                 "next_match": next_info,
-                "last_match": last_info
+                "last_match": last_info,
+                "recent_fixtures": recent_fixtures,
+                "upcoming_fixtures": upcoming_fixtures,
             }
         except Exception as e:
             log_warning(f"Error consultando FotMob overview: {e}")
             return {}
 
-    def _get_fotmob_match_lineup(self, page_url: str) -> Dict[str, Any]:
-        """Extrae la formación oficial de un partido en FotMob (titulares, suplentes, técnico, goles)."""
+    def _build_upcoming_agenda(self, fotmob_data: Dict[str, Any], team_key: str,
+                               home_label: str = "") -> list:
+        """Devuelve líneas de agenda futura ('después del de hoy' / 'el del finde') a partir de
+        upcoming_fixtures de FotMob. Saltea el primer elemento (= nextMatch, ya informado
+        aparte) y lista los siguientes. team_key: nombre normalizado del equipo para
+        calcular local/visitante. home_label: texto de estadio para el local (ej. Boca)."""
+        import unicodedata
+
+        def norm(s):
+            s = unicodedata.normalize("NFKD", s or "")
+            s = "".join(c for c in s if not unicodedata.combining(c))
+            return s.lower()
+
+        upcoming = fotmob_data.get("upcoming_fixtures") or []
+        tkey = norm(team_key)
+        lines = []
+        for fx in upcoming[1:5]:
+            home = fx.get("home", "")
+            away = fx.get("away", "")
+            is_home = tkey in norm(home)
+            rival = away if is_home else home
+            if is_home:
+                cond = f"Local ({home_label})" if home_label else "Local"
+            else:
+                cond = f"Visitante (cancha de {rival})"
+            lines.append(
+                f"- {fx.get('display_date', '')}: {home} vs {away} "
+                f"({cond}, {fx.get('tournament', '')})"
+            )
+        return lines
+
+    def _is_second_match_question(self, query: str) -> bool:
+        """Detecta si preguntan por el partido DESPUÉS del próximo ('después del de hoy',
+        'el siguiente', 'el del finde', etc.)."""
+        import unicodedata
+
+        def norm(s):
+            s = unicodedata.normalize("NFKD", s or "")
+            s = "".join(c for c in s if not unicodedata.combining(c))
+            return s.lower()
+
+        q = norm(query)
+        signals = [
+            "despues del de hoy", "despues de hoy", "despues del partido de hoy",
+            "despues de este partido", "despues de este", "despues del partido",
+            "el siguiente", "el que sigue", "el proximo despues", "el otro partido",
+            "fin de semana", "finde", "este finde", "el finde",
+            "y despues", "que viene despues", "cual sigue",
+        ]
+        return any(s in q for s in signals)
+
+    def _find_team_past_fixture(self, query: str, fotmob_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Busca en el fixture reciente de FotMob un partido JUGADO específico
+        pedido por el usuario (ej: 'la ida', 'el 11 contra San Pablo', 'la formación del partido anterior').
+        Funciona para cualquier equipo (el fixture ya viene del equipo consultado).
+        Devuelve el fixture (rival, torneo, fecha, pageUrl) o {} si no se identifica uno concreto."""
+        import unicodedata
+        from datetime import datetime, timezone
+
+        def norm(s):
+            s = unicodedata.normalize("NFKD", s or "")
+            s = "".join(c for c in s if not unicodedata.combining(c))
+            return s.lower().strip()
+
+        # Alias: lo que el usuario dice en español vs lo que dice FotMob
+        RIVAL_ALIASES = {
+            "san pablo": "sao paulo",
+            "sao paulo": "sao paulo",
+        }
+
+        def canon(name):
+            n = norm(name)
+            for alias, canonical in RIVAL_ALIASES.items():
+                if alias in n:
+                    return canonical
+            return n
+
+        q = norm(query)
+        fixtures = fotmob_data.get("recent_fixtures") or []
+        if not fixtures:
+            return {}
+        next_m = fotmob_data.get("next_match") or {}
+
+        # Señales de que se pregunta por un partido ya jugado (no el próximo)
+        past_signals = ["ida", "vuelta", "anterior", "pasado", "pasada", "ayer",
+                        "anteayer", "fue", "fueron", "jugo", "jugaron"]
+        if not any(s in q for s in past_signals):
+            return {}
+
+        target_rival = ""
+        target_tournament = ""
+        if "ida" in q or "vuelta" in q:
+            # "la ida" = el otro partido contra el rival del próximo, mismo torneo
+            target_rival = canon(next_m.get("rival", ""))
+            target_tournament = norm(next_m.get("tournament", ""))
+        else:
+            for fx in fixtures:
+                r = canon(fx.get("rival", ""))
+                if r and r in q:
+                    target_rival = r
+                    break
+            for fx in fixtures:
+                t = norm(fx.get("tournament", ""))
+                if t and len(t) > 4 and t in q:
+                    target_tournament = t
+                    break
+
+        if not target_rival:
+            return {}
+
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        for fx in sorted(fixtures, key=lambda f: f.get("utc_time", ""), reverse=True):
+            if fx.get("utc_time", "")[:10] >= today:
+                continue  # todavía no se jugó
+            if canon(fx.get("rival", "")) != target_rival:
+                continue
+            if target_tournament and norm(fx.get("tournament", "")) != target_tournament:
+                continue
+            return fx
+        return {}
+
+    def _get_fotmob_match_lineup(self, page_url: str, team_name: str = "Boca") -> Dict[str, Any]:
+        """Extrae la formación oficial de un partido en FotMob (titulares, suplentes, técnico, goles).
+        team_name selecciona de qué lado de la planilla se extrae (por defecto Boca, como siempre)."""
         import urllib.request
         import json
         import re
+        import unicodedata
+
+        def norm(s):
+            s = unicodedata.normalize("NFKD", s or "")
+            s = "".join(c for c in s if not unicodedata.combining(c))
+            return s.lower()
+
+        team_key = norm(team_name)
 
         if not page_url:
             return {}
@@ -1309,12 +1691,12 @@ class SystemControl:
             
             home = lineup_data.get('homeTeam', {})
             away = lineup_data.get('awayTeam', {})
-            boca = home if "Boca" in home.get('name', '') else (away if "Boca" in away.get('name', '') else home)
-            
-            starters = [f"#{p.get('shirtNumber', p.get('shirt', ''))} {p.get('name', '')}" for p in boca.get('starters', [])]
-            subs = [f"#{p.get('shirtNumber', p.get('shirt', ''))} {p.get('name', '')}" for p in boca.get('subs', [])]
-            coach = boca.get('coach', {}).get('name', '')
-            formation = boca.get('formation', '')
+            side = home if team_key in norm(home.get('name', '')) else (away if team_key in norm(away.get('name', '')) else home)
+
+            starters = [f"#{p.get('shirtNumber', p.get('shirt', ''))} {p.get('name', '')}" for p in side.get('starters', [])]
+            subs = [f"#{p.get('shirtNumber', p.get('shirt', ''))} {p.get('name', '')}" for p in side.get('subs', [])]
+            coach = side.get('coach', {}).get('name', '')
+            formation = side.get('formation', '')
             
             goals = []
             events = match_facts.get('events', {}).get('events', [])
@@ -1327,7 +1709,7 @@ class SystemControl:
                     goals.append(f"{player} {time_m}' {score_txt}".strip())
                     
             return {
-                "team": boca.get('name', 'Boca Juniors'),
+                "team": side.get('name', team_name),
                 "formation": formation,
                 "coach": coach,
                 "starters": starters,
@@ -1367,8 +1749,9 @@ class SystemControl:
             log_warning(f"Error consultando noticias de 11 probable: {e}")
         return ""
 
+    @_timed
     def get_boca_juniors_info(self, topic: str = "todo") -> Dict[str, Any]:
-        """Obtiene información deportiva oficial y en tiempo real de Boca Juniors: próximo partido (fecha, hora argentina, estadio, torneo) desde FotMob, formación oficial confirmada, últimos resultados y actualidad de Ezeiza."""
+        """Obtiene información deportiva oficial y en tiempo real de Boca Juniors: próximo partido (fecha, hora argentina, estadio, torneo) desde FotMob, formación oficial confirmada, últimos resultados, actualidad de Ezeiza, agenda de próximos partidos (para 'después del de hoy' / 'el del finde') Y partidos anteriores específicos (la ida/vuelta de una llave como 'el 11 de la ida vs San Pablo', o la formación titular de un partido pasado contra un rival nombrado). Para partidos jugados usa la planilla oficial confirmada de FotMob y, si no la tiene, la ficha oficial de ESPN como respaldo."""
         import os
         import urllib.request
         import json
@@ -1378,12 +1761,101 @@ class SystemControl:
         import html
         from datetime import datetime, timedelta
 
+        clean_q = (topic or "").strip()
+
+        # 0. Instrucción crítica de fechas y personalidad (se usa en todos los caminos de respuesta)
+        instruction = (
+            "[REGLA CRÍTICA DE FECHA Y HORARIO]:\n"
+            "La fecha y hora indicada arriba YA ESTÁ CONVERTIDA AL HUSO HORARIO DE ARGENTINA (UTC-3).\n"
+            "Si el próximo partido dice 'HOY' (ej: 'HOY Viernes 11 de septiembre a las 21:30 hs'), respondé con total seguridad que Boca juega HOY. NUNCA digas que juega mañana.\n\n"
+            "[INSTRUCCIÓN CRÍTICA DE RESPUESTA Y PERTINENCIA]:\n"
+            "- Respondé ÚNICAMENTE a lo que te preguntó el usuario.\n"
+            "- Si te preguntan cuándo juega Boca, contra quién, la hora o el estadio: hablá del próximo partido confirmado.\n"
+            "- Si te preguntan por el partido DESPUÉS del de hoy (el siguiente, el que sigue, el del finde/fin de semana): hablá del bloque EL PARTIDO SIGUIENTE DE BOCA de abajo, NO del próximo inmediato.\n"
+            "- Si te preguntan por la agenda o los próximos partidos en general: mencioná el próximo y los 2 o 3 que siguen.\n"
+            "- Si te preguntan cómo forma Boca, quiénes juegan o la formación del próximo partido antes de que esté confirmada la planilla oficial (1 hora antes): explicá que la formación oficial sale 1 hora antes del partido en el vestuario, comentá las novedades de las prácticas o el 11 de referencia, y jamás inventes nombres de jugadores.\n"
+            "- Si te preguntan por cómo salió el partido anterior: da el resultado exacto, los goles y quiénes jugaron.\n"
+            "- Cero citas a diarios o páginas web: hablá en primera persona como el compinche xeneize más apasionado.\n"
+            "- Respondé con pasión de potrero, al hueso y con ritmo oral (generalmente entre 2 y 3 oraciones)."
+        )
+
         report = []
-        
+
         # 1. Consulta en tiempo real a FotMob (Fixture + Último partido + Planilla oficial)
         fotmob_data = self._get_fotmob_boca_data()
         next_m = fotmob_data.get("next_match")
         last_m = fotmob_data.get("last_match")
+
+        # 1b. FIX 2026-09-15: partido anterior específico ("la ida", "el 11 vs San Pablo"...).
+        # Antes solo se miraban próximo y último: si hubo un partido en el medio,
+        # la ida no tenía de dónde salir y Gemini respondía "no la tengo".
+        past_fx = self._find_team_past_fixture(clean_q, fotmob_data)
+        if past_fx and past_fx.get("pageUrl"):
+            past_lu = self._get_fotmob_match_lineup(past_fx["pageUrl"])
+            # FIX2 2026-09-15: FotMob a veces NO tiene la planilla real del partido
+            # jugado (lineupType 'lastStarting11' = el 11 del ÚLTIMO partido de cada
+            # equipo, no el de este). Solo se presenta como oficial si is_confirmed.
+            if past_lu.get("is_confirmed") and past_lu.get("starters"):
+                report.append(
+                    f"PARTIDO ANTERIOR CONSULTADO (Fuente oficial en vivo: FotMob):\n"
+                    f"- Partido: {past_fx['home']} {past_fx['score']} {past_fx['away']}\n"
+                    f"- Torneo: {past_fx['tournament']}\n"
+                    f"- Disputado: {past_fx['display_date']}"
+                )
+                coach_txt = f" - DT {past_lu['coach']}" if past_lu.get("coach") else ""
+                report.append(
+                    f"• 11 TITULAR DE BOCA EN ESE PARTIDO (Esquema {past_lu.get('formation', '')}{coach_txt}):\n"
+                    f"  {', '.join(past_lu['starters'])}"
+                )
+                if past_lu.get("subs"):
+                    report.append(f"• Suplentes: {', '.join(past_lu['subs'][:8])}...")
+                if past_lu.get("goals"):
+                    report.append(f"• Goles del partido: {', '.join(past_lu['goals'])}")
+                report.append(instruction)
+                final_text = "\n\n".join(report)
+                state_mgr.emit_tool_call("get_boca_juniors_info", {"topic": topic}, f"Partido anterior vs {past_fx['rival']} (FotMob)")
+                return {"status": "success", "results": final_text}
+            # Fallback: ficha oficial de ESPN para ese partido (fecha ±1 día por zona horaria).
+            espn_report = ""
+            try:
+                from datetime import datetime as _dt
+                fx_dt = None
+                try:
+                    fx_dt = _dt.fromisoformat((past_fx.get("utc_time", "") or "").replace("Z", "+00:00"))
+                except Exception:
+                    fx_dt = None
+                t_low = (past_fx.get("tournament", "") or "").lower()
+                espn_league = None
+                for _k, _v in {"sudamericana": "conmebol.sudamericana",
+                               "libertadores": "conmebol.libertadores",
+                               "liga profesional": "arg.1",
+                               "copa argentina": "arg.copa"}.items():
+                    if _k in t_low:
+                        espn_league = _v
+                        break
+                if fx_dt:
+                    espn_report = self.get_soccer_match_sheet(team_query="boca", target_date=fx_dt, specific_league=espn_league)
+            except Exception:
+                espn_report = ""
+            if espn_report:
+                final_text = (
+                    f"PARTIDO ANTERIOR CONSULTADO (Fuente oficial en vivo: ESPN):\n"
+                    f"- Partido: {past_fx['home']} {past_fx['score']} {past_fx['away']}\n"
+                    f"- Torneo: {past_fx['tournament']}\n"
+                    f"- Disputado: {past_fx['display_date']}\n"
+                    f"- Nota: FotMob no publicó la planilla real de este partido; se usa la ficha oficial de ESPN.\n\n"
+                    f"{espn_report}\n\n{instruction}"
+                )
+                state_mgr.emit_tool_call("get_boca_juniors_info", {"topic": topic}, f"Partido anterior vs {past_fx['rival']} (ESPN)")
+                return {"status": "success", "results": final_text}
+            final_text = (
+                f"PARTIDO ANTERIOR CONSULTADO:\n"
+                f"- Partido: {past_fx['home']} {past_fx['score']} {past_fx['away']} ({past_fx['tournament']}, {past_fx['display_date']})\n"
+                f"- No se pudo obtener la planilla oficial de este partido (ni FotMob ni ESPN la tienen). "
+                f"Decí que no conseguiste la formación exacta y NO inventes un 11 titular."
+            )
+            state_mgr.emit_tool_call("get_boca_juniors_info", {"topic": topic}, f"Partido anterior vs {past_fx['rival']} (sin planilla)")
+            return {"status": "success", "results": final_text}
 
         if next_m:
             report.append(
@@ -1415,6 +1887,26 @@ class SystemControl:
                             f"La planilla oficial todavía NO fue confirmada (se entrega en el vestuario 1 hora antes del partido).\n"
                             f"{prob_info}{ref_txt}"
                         )
+
+        # 1c. FIX 2026-09-15: agenda futura de FotMob ("después del de hoy" / "el del finde").
+        # upcoming_fixtures[0] es el nextMatch ya informado; [1] es el siguiente.
+        upcoming = fotmob_data.get("upcoming_fixtures") or []
+        if self._is_second_match_question(clean_q) and len(upcoming) >= 2:
+            sec = upcoming[1]
+            sec_home, sec_away = sec.get("home", ""), sec.get("away", "")
+            sec_cond = "Local (en La Bombonera)" if "boca" in sec_home.lower() else f"Visitante (cancha de {sec_home})"
+            report.append(
+                f"EL PARTIDO SIGUIENTE DE BOCA (después del de hoy - Fuente oficial en vivo: FotMob):\n"
+                f"- Cuándo: {sec['display_date']}\n"
+                f"- Partido: {sec_home} vs {sec_away} ({sec_cond})\n"
+                f"- Torneo: {sec['tournament']}"
+            )
+        agenda_lines = self._build_upcoming_agenda(fotmob_data, "boca", home_label="en La Bombonera")
+        if agenda_lines:
+            report.append(
+                "AGENDA DE PRÓXIMOS PARTIDOS DE BOCA (Fuente oficial en vivo: FotMob):\n"
+                + "\n".join(agenda_lines)
+            )
 
         if last_m:
             report.append(
@@ -1454,27 +1946,175 @@ class SystemControl:
         except Exception:
             pass
 
-        # 3. Instrucción crítica de fechas y personalidad
-        instruction = (
-            "[REGLA CRÍTICA DE FECHA Y HORARIO]:\n"
-            "La fecha y hora indicada arriba YA ESTÁ CONVERTIDA AL HUSO HORARIO DE ARGENTINA (UTC-3).\n"
-            "Si el próximo partido dice 'HOY' (ej: 'HOY Viernes 11 de septiembre a las 21:30 hs'), respondé con total seguridad que Boca juega HOY. NUNCA digas que juega mañana.\n\n"
-            "[INSTRUCCIÓN CRÍTICA DE RESPUESTA Y PERTINENCIA]:\n"
-            "- Respondé ÚNICAMENTE a lo que te preguntó el usuario.\n"
-            "- Si te preguntan cuándo juega Boca, contra quién, la hora o el estadio: hablá del próximo partido confirmado.\n"
-            "- Si te preguntan cómo forma Boca, quiénes juegan o la formación del próximo partido antes de que esté confirmada la planilla oficial (1 hora antes): explicá que la formación oficial sale 1 hora antes del partido en el vestuario, comentá las novedades de las prácticas o el 11 de referencia, y jamás inventes nombres de jugadores.\n"
-            "- Si te preguntan por cómo salió el partido anterior: da el resultado exacto, los goles y quiénes jugaron.\n"
-            "- Cero citas a diarios o páginas web: hablá en primera persona como el compinche xeneize más apasionado.\n"
-            "- Respondé con pasión de potrero, al hueso y con ritmo oral (generalmente entre 2 y 3 oraciones)."
-        )
+        # 3. Instrucción crítica de fechas y personalidad (definida al inicio de la función)
         report.append(instruction)
 
         final_text = "\n\n".join(report)
         state_mgr.emit_tool_call("get_boca_juniors_info", {"topic": topic}, "Datos de Boca Juniors (FotMob + Ezeiza)")
         return {"status": "success", "results": final_text}
 
+    def _espn_league_for_tournament(self, tournament: str):
+        """Mapea el nombre del torneo de FotMob al ID de liga de ESPN (para el fallback)."""
+        t_low = (tournament or "").lower()
+        for _k, _v in {"sudamericana": "conmebol.sudamericana",
+                       "libertadores": "conmebol.libertadores",
+                       "liga profesional": "arg.1",
+                       "copa argentina": "arg.copa"}.items():
+            if _k in t_low:
+                return _v
+        return None
+
+    def _build_team_fotmob_report(self, team_id: int, display_name: str, match_key: str, query: str) -> str:
+        """Reporte en vivo de FotMob para un equipo mapeado que NO es Boca: próximo partido,
+        agenda futura ('después del de hoy' / 'el del finde'),
+        último resultado y partido anterior específico ('la ida', 'el 11 vs X').
+        Usa la planilla confirmada de FotMob y la ficha de ESPN como respaldo.
+        Tono neutro: la voz xeneize apasionada es solo para Boca."""
+        from datetime import datetime as _dt
+
+        clean_q = (query or "").strip()
+        fotmob_data = self._get_fotmob_team_data(team_id, match_key)
+        next_m = fotmob_data.get("next_match")
+        last_m = fotmob_data.get("last_match")
+        if not next_m and not last_m and not fotmob_data.get("recent_fixtures"):
+            return ""
+
+        instruction = (
+            "[INSTRUCCIÓN DE RESPUESTA]:\n"
+            "- Respondé ÚNICAMENTE a lo que te preguntó el usuario.\n"
+            "- Si preguntan por el partido DESPUÉS del próximo (el siguiente, el del finde): respondé con el bloque EL PARTIDO SIGUIENTE, no con el próximo inmediato.\n"
+            "- La fecha y hora indicada YA ESTÁ CONVERTIDA AL HUSO HORARIO DE ARGENTINA (UTC-3).\n"
+            "- Si la formación oficial todavía no está confirmada (se confirma 1 hora antes del partido), decilo claramente y JAMÁS inventes nombres de jugadores.\n"
+            "- Respondé en 2 o 3 oraciones, al hueso y con ritmo oral."
+        )
+        report = []
+
+        # 1. Partido anterior específico ("la ida", "el 11 vs X", "la formación del partido pasado").
+        past_fx = self._find_team_past_fixture(clean_q, fotmob_data)
+        if past_fx and past_fx.get("pageUrl"):
+            past_lu = self._get_fotmob_match_lineup(past_fx["pageUrl"], team_name=match_key)
+            if past_lu.get("is_confirmed") and past_lu.get("starters"):
+                report.append(
+                    f"PARTIDO ANTERIOR CONSULTADO (Fuente oficial en vivo: FotMob):\n"
+                    f"- Partido: {past_fx['home']} {past_fx['score']} {past_fx['away']}\n"
+                    f"- Torneo: {past_fx['tournament']}\n"
+                    f"- Disputado: {past_fx['display_date']}"
+                )
+                coach_txt = f" - DT {past_lu['coach']}" if past_lu.get("coach") else ""
+                report.append(
+                    f"• 11 TITULAR DE {display_name.upper()} EN ESE PARTIDO (Esquema {past_lu.get('formation', '')}{coach_txt}):\n"
+                    f"  {', '.join(past_lu['starters'])}"
+                )
+                if past_lu.get("subs"):
+                    report.append(f"• Suplentes: {', '.join(past_lu['subs'][:8])}...")
+                if past_lu.get("goals"):
+                    report.append(f"• Goles del partido: {', '.join(past_lu['goals'])}")
+                report.append(instruction)
+                return "\n\n".join(report)
+            # Fallback: ficha oficial de ESPN para ese partido (fecha ±1 día por zona horaria).
+            espn_report = ""
+            try:
+                fx_dt = None
+                try:
+                    fx_dt = _dt.fromisoformat((past_fx.get("utc_time", "") or "").replace("Z", "+00:00"))
+                except Exception:
+                    fx_dt = None
+                if fx_dt:
+                    espn_report = self.get_soccer_match_sheet(
+                        team_query=display_name,
+                        target_date=fx_dt,
+                        specific_league=self._espn_league_for_tournament(past_fx.get("tournament", "")))
+            except Exception:
+                espn_report = ""
+            if espn_report:
+                return (
+                    f"PARTIDO ANTERIOR CONSULTADO (Fuente oficial en vivo: ESPN):\n"
+                    f"- Partido: {past_fx['home']} {past_fx['score']} {past_fx['away']}\n"
+                    f"- Torneo: {past_fx['tournament']}\n"
+                    f"- Disputado: {past_fx['display_date']}\n"
+                    f"- Nota: FotMob no publicó la planilla real de este partido; se usa la ficha oficial de ESPN.\n\n"
+                    f"{espn_report}\n\n{instruction}"
+                )
+            return (
+                f"PARTIDO ANTERIOR CONSULTADO:\n"
+                f"- Partido: {past_fx['home']} {past_fx['score']} {past_fx['away']} ({past_fx['tournament']}, {past_fx['display_date']})\n"
+                f"- No se pudo obtener la planilla oficial de este partido (ni FotMob ni ESPN la tienen). "
+                f"Decí que no conseguiste la formación exacta y NO inventes un 11 titular.\n\n{instruction}"
+            )
+
+        # 2. Próximo partido.
+        if next_m:
+            report.append(
+                f"PRÓXIMO PARTIDO DE {display_name.upper()} (Fuente oficial en vivo: FotMob):\n"
+                f"- Cuándo: {next_m['display_date']}\n"
+                f"- Rival: {next_m['rival']}\n"
+                f"- Condición: {next_m['condition']}\n"
+                f"- Torneo: {next_m['tournament']}"
+            )
+            if next_m.get('pageUrl'):
+                next_lu = self._get_fotmob_match_lineup(next_m['pageUrl'], team_name=match_key)
+                if next_lu.get('starters'):
+                    if next_lu.get('is_confirmed'):
+                        coach_txt = f" - DT {next_lu['coach']}" if next_lu.get('coach') else ""
+                        report.append(
+                            f"FORMACIÓN TITULAR OFICIAL CONFIRMADA (Esquema {next_lu.get('formation', '')}{coach_txt}):\n"
+                            f"• Titulares: {', '.join(next_lu['starters'])}\n"
+                            f"• Suplentes: {', '.join(next_lu['subs'][:8])}..."
+                        )
+                    else:
+                        report.append(
+                            "FORMACIÓN: la planilla oficial todavía no fue confirmada "
+                            "(se confirma 1 hora antes del partido)."
+                        )
+
+        # 2b. FIX 2026-09-15: agenda futura de FotMob ("después del de hoy" / "el del finde").
+        upcoming = fotmob_data.get("upcoming_fixtures") or []
+        if self._is_second_match_question(clean_q) and len(upcoming) >= 2:
+            sec = upcoming[1]
+            sec_home, sec_away = sec.get("home", ""), sec.get("away", "")
+            import unicodedata as _ud
+            _norm = lambda x: "".join(c for c in _ud.normalize("NFKD", x or "") if not _ud.combining(c)).lower()
+            sec_is_home = _norm(match_key) in _norm(sec_home)
+            sec_cond = "Local" if sec_is_home else f"Visitante (cancha de {sec_home})"
+            report.append(
+                f"EL PARTIDO SIGUIENTE DE {display_name.upper()} (después del próximo - FotMob):\n"
+                f"- Cuándo: {sec['display_date']}\n"
+                f"- Partido: {sec_home} vs {sec_away} ({sec_cond})\n"
+                f"- Torneo: {sec['tournament']}"
+            )
+        agenda_lines = self._build_upcoming_agenda(fotmob_data, match_key)
+        if agenda_lines:
+            report.append(
+                f"AGENDA DE PRÓXIMOS PARTIDOS DE {display_name.upper()} (FotMob):\n"
+                + "\n".join(agenda_lines)
+            )
+
+        # 3. Último partido jugado.
+        if last_m:
+            report.append(
+                f"ÚLTIMO PARTIDO DE {display_name.upper()} (FotMob):\n"
+                f"- Resultado: {last_m['match']}\n"
+                f"- Torneo: {last_m['tournament']}\n"
+                f"- Disputado: {last_m['display_date']}"
+            )
+            if last_m.get('pageUrl'):
+                last_lu = self._get_fotmob_match_lineup(last_m['pageUrl'], team_name=match_key)
+                if last_lu.get('goals'):
+                    report.append(f"• Goles del último partido: {', '.join(last_lu['goals'])}")
+                if last_lu.get('starters'):
+                    coach_txt = f" - DT {last_lu['coach']}" if last_lu.get('coach') else ""
+                    report.append(
+                        f"• 11 Titular que jugó ese partido (Esquema {last_lu.get('formation', '')}{coach_txt}):\n"
+                        f"  {', '.join(last_lu['starters'])}"
+                    )
+
+        report.append(instruction)
+        return "\n\n".join(report)
+
+    @_timed
     def get_soccer_info(self, query: str = "", team: str = "", date: str = "") -> Dict[str, Any]:
         """Consulta datos de fútbol (fichas técnicas, formaciones oficiales, goles, resultados históricos o recientes) de cualquier equipo o final."""
+        log_info(f"[TOOLS] get_soccer_info llamado con query={query!r} team={team!r} date={date!r}")
         clean_q = (query or team or "").strip()
         
         # 1. Finales históricas detectadas
@@ -1485,10 +2125,26 @@ class SystemControl:
                 state_mgr.emit_tool_call("get_soccer_info", {"query": clean_q, "date": hist_dt}, "Ficha histórica ESPN")
                 return {"status": "success", "results": sheet}
 
-        # 2. Si es Boca y piden próximo o último partido
+        # 2. Si es Boca y piden próximo o último partido.
+        # Se mira query+team COMBINADOS: el modelo a veces pasa el equipo solo en
+        # 'team' (ej. query="cuál es el próximo partido después del de hoy",
+        # team="Boca"), y con (query or team) el team se perdía.
         lower_q = clean_q.lower()
-        if any(b in lower_q for b in ["boca", "xeneize", "bombonera"]) and not any(yr in lower_q for yr in ["2024", "2023", "2022", "2021", "2020", "2018", "2007", "2000"]):
+        team_text = f"{query or ''} {team or ''}".strip().lower()
+        if any(b in team_text for b in ["boca", "xeneize", "bombonera"]) and not any(yr in lower_q for yr in ["2024", "2023", "2022", "2021", "2020", "2018", "2007", "2000"]):
             return self.get_boca_juniors_info(clean_q)
+
+        # 2b. Delegación a FotMob para equipos argentinos mapeados (no Boca).
+        # La implementación vive en get_fotmob_team_info, con la misma filosofía
+        # que get_boca_juniors_info: el equipo sale de un mapa hard-codeado,
+        # sin adivinar intenciones. Si hay fecha puntual se deja a ESPN (paso 3).
+        if not (date or "").strip():
+            fotmob_res = self.get_fotmob_team_info(query=query, team=team)
+            if fotmob_res.get("status") == "success":
+                state_mgr.emit_tool_call("get_soccer_info", {"query": clean_q}, "FotMob (delegado)")
+                return fotmob_res
+        # Si no es un equipo mapeado (o es Boca, o FotMob falló), se sigue al
+        # flujo normal (ESPN -> search_web).
 
         # 3. Match sheet de ESPN para cualquier equipo / fecha
         sheet = self.get_soccer_match_sheet(team_query=clean_q, target_date=date if date else None)
@@ -1499,6 +2155,37 @@ class SystemControl:
         # 4. Fallback a búsqueda web
         return self.search_web(clean_q)
 
+    def get_fotmob_team_info(self, query: str = "", team: str = "") -> Dict[str, Any]:
+        """Reporte en vivo de FotMob (próximo partido, último resultado, formación)
+        para equipos argentinos mapeados (NO Boca: ese tiene su herramienta propia).
+        Vía Boca-like: el equipo se resuelve de query+team contra el mapa
+        hard-codeado FOTMOB_TEAMS, sin adivinar intenciones ni parámetros."""
+        log_info(f"[TOOLS] get_fotmob_team_info llamado con query={query!r} team={team!r}")
+        text = f"{query or ''} {team or ''}".strip()
+        found = self.match_fotmob_team(text)
+        if not found:
+            return {"status": "not_mapped",
+                    "results": ("Ese equipo no está en el mapa de FotMob. "
+                                "Usá get_soccer_info (ESPN/web).")}
+        tid, display, mkey = found
+        if display == "Boca Juniors":
+            return {"status": "not_mapped",
+                    "results": ("Para Boca Juniors usá SIEMPRE get_boca_juniors_info, "
+                                "nunca esta herramienta.")}
+        log_info(f"[FotMob] equipo detectado: {display} (id {tid})")
+        try:
+            report = self._build_team_fotmob_report(tid, display, mkey, text)
+        except Exception as e:
+            log_warning(f"[FotMob] falló para {display}: {e}")
+            report = None
+        if report:
+            state_mgr.emit_tool_call("get_fotmob_team_info", {"query": text}, f"FotMob {display}")
+            return {"status": "success", "results": report}
+        return {"status": "empty",
+                "results": (f"No se pudo obtener datos en vivo de {display} en FotMob. "
+                            "Usá get_soccer_info.")}
+
+    @_timed
     def search_web(self, query: str = "") -> Dict[str, Any]:
         """Busca en internet información en tiempo real: próximos partidos, resultados deportivos, formaciones oficiales, noticias de hoy, etc."""
         import urllib.request
@@ -1729,12 +2416,53 @@ class SystemControl:
                             buf = ctypes.create_unicode_buffer(length + 1)
                             user32.GetWindowTextW(curr, buf, length + 1)
                             t = buf.value.lower()
-                            if "youtube" in t or "brave" in t:
+                            # B-25: antes era `"youtube" in t or "brave" in t` y como
+                            # todo título de Brave termina en "- Brave", cerraba
+                            # TODAS las ventanas de Brave aunque no fueran YouTube.
+                            if "youtube" in t:
                                 user32.PostMessageW(curr, 0x0010, 0, 0)  # WM_CLOSE
                 except Exception:
                     pass
         except Exception:
             pass
+
+    def _open_url_in_brave(self, url: str) -> bool:
+        """Abre una URL explícitamente en Brave, nunca en el navegador por defecto.
+
+        En la PC de Exequiel el navegador por defecto puede ser Chrome; YouTube
+        (y la música) tienen que abrirse siempre en Brave. Retorna True si logró
+        lanzar Brave. Solo tiene efecto real en Windows.
+        """
+        if os.name != 'nt':
+            return False
+        brave_paths = [
+            r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
+            r"C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe",
+            os.path.expandvars(r"%LOCALAPPDATA%\BraveSoftware\Brave-Browser\Application\brave.exe")
+        ]
+        brave_args = f'--new-window --autoplay-policy=no-user-gesture-required --enable-features=HardwareMediaKeyHandling "{url}"'
+        for b_path in brave_paths:
+            if os.path.exists(b_path):
+                try:
+                    # ShellExecuteW con SW_SHOWNORMAL (1) fuerza a Windows a mostrar la ventana en primer plano
+                    ret = ctypes.windll.shell32.ShellExecuteW(
+                        None, "open", b_path, brave_args, os.path.dirname(b_path), 1
+                    )
+                    if ret > 32:
+                        log_info(f"URL abierta en primer plano con Brave (ShellExecuteW): {url}")
+                        return True
+                except Exception as b_err:
+                    log_warning(f"Error abriendo con ShellExecuteW ({b_path}): {b_err}")
+                try:
+                    popen_silent(
+                        [b_path, "--new-window", "--autoplay-policy=no-user-gesture-required", "--enable-features=HardwareMediaKeyHandling", url],
+                        cwd=os.path.dirname(b_path)
+                    )
+                    log_info(f"URL abierta con Brave (popen_silent): {url}")
+                    return True
+                except Exception as b_err:
+                    log_warning(f"Error abriendo con Brave ({b_path}): {b_err}")
+        return False
 
     def play_youtube(self, query: str) -> Dict[str, Any]:
         """Busca y reproduce un video o canción en YouTube directamente en el navegador Brave en primer plano, reemplazando cualquier reproducción anterior."""
@@ -1848,39 +2576,7 @@ class SystemControl:
         self.close_existing_youtube_windows()
         time.sleep(0.35)
 
-        brave_paths = [
-            r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
-            r"C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe",
-            os.path.expandvars(r"%LOCALAPPDATA%\BraveSoftware\Brave-Browser\Application\brave.exe")
-        ]
-
-        opened = False
-        brave_args = f'--new-window --autoplay-policy=no-user-gesture-required --enable-features=HardwareMediaKeyHandling "{target_url}"'
-
-        for b_path in brave_paths:
-            if os.path.exists(b_path):
-                try:
-                    # ShellExecuteW con SW_SHOWNORMAL (1) fuerza a Windows a mostrar la ventana en primer plano
-                    ret = ctypes.windll.shell32.ShellExecuteW(
-                        None, "open", b_path, brave_args, os.path.dirname(b_path), 1
-                    )
-                    if ret > 32:
-                        opened = True
-                        log_info(f"YouTube abierto en primer plano con Brave (ShellExecuteW): {target_url}")
-                        break
-                except Exception as b_err:
-                    log_warning(f"Error abriendo con ShellExecuteW ({b_path}): {b_err}")
-
-                try:
-                    popen_silent(
-                        [b_path, "--new-window", "--autoplay-policy=no-user-gesture-required", "--enable-features=HardwareMediaKeyHandling", target_url],
-                        cwd=os.path.dirname(b_path)
-                    )
-                    opened = True
-                    log_info(f"YouTube abierto con Brave (popen_silent): {target_url}")
-                    break
-                except Exception as b_err:
-                    log_warning(f"Error abriendo con Brave ({b_path}): {b_err}")
+        opened = self._open_url_in_brave(target_url)
 
         # Asegurar que el audio de la nueva canción esté habilitado y no herede mute
         def _unmute_watcher():
@@ -1942,7 +2638,6 @@ class SystemControl:
         import os
         import json
         import subprocess
-        from tools.app_launcher import app_launcher
 
         raw_q = (query or "").strip()
         clean_q = raw_q
@@ -2003,16 +2698,28 @@ class SystemControl:
         # Asegurar que Spotify esté iniciado
         is_running = self._ensure_spotify_running()
         if not is_running:
-            app_launcher.launch("spotify")
+            # B-5: lanzamiento directo (app_launcher.launch no existe y
+            # launch_app("spotify") reentraría a play_spotify en loop).
+            if not self._launch_spotify_exe():
+                msg = "No pude abrir Spotify en la PC: no está corriendo y no logré iniciarlo."
+                log_warning(f"[Spotify] {msg}")
+                state_mgr.emit_tool_call("play_spotify", {"query": query}, msg)
+                return {"status": "error", "message": msg}
 
-        # Si no hay término de búsqueda, solo abrir o reanudar Spotify
+        # Si no hay término de búsqueda, solo reanudar Spotify
         if not clean_q:
             if cli_path:
-                run_silent([cli_path, "open"], capture_output=True)
+                # B-29: antes se disparaban "open" + "resume". El "open" sobra:
+                # _ensure_spotify_running ya trajo la ventana al frente; solo
+                # queda asegurarse de que suene.
                 run_silent([cli_path, "resume"], capture_output=True)
                 self._bring_spotify_window_to_front()
-            else:
-                app_launcher.launch("spotify")
+            elif not self._launch_spotify_exe():
+                # B-5: idem arriba, sin CLI solo queda el ejecutable directo.
+                msg = "No pude abrir Spotify en la PC."
+                log_warning(f"[Spotify] {msg}")
+                state_mgr.emit_tool_call("play_spotify", {"query": query}, msg)
+                return {"status": "error", "message": msg}
             msg = "Ahí te abrí Spotify, fiera."
             state_mgr.emit_tool_call("play_spotify", {"query": ""}, msg)
             return {"status": "success", "message": msg}
@@ -2049,11 +2756,21 @@ class SystemControl:
         if not target_uri:
             target_uri = f"spotify:search:{urllib.parse.quote(clean_q)}"
 
-        # 2. Ejecutar reproducción y navegación (completamente en segundo plano sin ventanas)
+        # 2. Ejecutar reproducción (completamente en segundo plano sin ventanas)
         if cli_path:
-            run_silent([cli_path, "play", target_uri], capture_output=True, text=True)
-            run_silent([cli_path, "navigate", target_uri, "--play"], capture_output=True, text=True)
-            run_silent([cli_path, "open", target_uri], capture_output=True, text=True)
+            # B-29: antes se disparaban "play" + "navigate --play" + "open"
+            # a la vez y se pisaban entre sí. Ahora un solo comando: se prueba
+            # en orden y se frena en el primero que funcione.
+            for cmd in (["play", target_uri],
+                        ["navigate", target_uri, "--play"],
+                        ["open", target_uri]):
+                try:
+                    res = run_silent([cli_path] + cmd, capture_output=True,
+                                     text=True, timeout=8)
+                    if res.returncode == 0:
+                        break
+                except Exception:
+                    continue
             self._bring_spotify_window_to_front()
         else:
             uri = f"spotify:search:{urllib.parse.quote(clean_q)}"
@@ -2067,6 +2784,11 @@ class SystemControl:
 
     def close_active_window(self) -> Dict[str, Any]:
         """Cierra la ventana activa actual enviando Alt+F4"""
+        # B-24: en Linux ctypes.windll no existe; delegar al satélite.
+        if os.name != 'nt':
+            remote_res = self._remote_exec_if_linux("close_active_window", {}, "Listo, cerré la ventana activa en la compu.")
+            if remote_res:
+                return remote_res
         try:
             user32 = ctypes.windll.user32
             VK_MENU = 0x12
@@ -2084,6 +2806,11 @@ class SystemControl:
 
     def maximize_active_window(self) -> Dict[str, Any]:
         """Maximiza la ventana activa"""
+        # B-24: en Linux ctypes.windll no existe; delegar al satélite.
+        if os.name != 'nt':
+            remote_res = self._remote_exec_if_linux("maximize_active_window", {}, "Ventana maximizada en la compu, papá.")
+            if remote_res:
+                return remote_res
         try:
             user32 = ctypes.windll.user32
             hwnd = user32.GetForegroundWindow()
@@ -2098,6 +2825,11 @@ class SystemControl:
 
     def minimize_active_window(self) -> Dict[str, Any]:
         """Minimiza la ventana activa"""
+        # B-24: en Linux ctypes.windll no existe; delegar al satélite.
+        if os.name != 'nt':
+            remote_res = self._remote_exec_if_linux("minimize_active_window", {}, "Ventana minimizada en la compu, che.")
+            if remote_res:
+                return remote_res
         try:
             user32 = ctypes.windll.user32
             hwnd = user32.GetForegroundWindow()
@@ -2112,6 +2844,11 @@ class SystemControl:
 
     def switch_active_window(self) -> Dict[str, Any]:
         """Cambia a la siguiente ventana activa con Alt+Tab"""
+        # B-24: en Linux ctypes.windll no existe; delegar al satélite.
+        if os.name != 'nt':
+            remote_res = self._remote_exec_if_linux("switch_active_window", {}, "Ahí pasé a la otra ventana en la compu.")
+            if remote_res:
+                return remote_res
         try:
             user32 = ctypes.windll.user32
             VK_MENU = 0x12
@@ -2168,9 +2905,25 @@ class SystemControl:
             "mercadolibre": "https://www.mercadolibre.com.ar",
             "gmail": "https://mail.google.com",
             "reddit": "https://www.reddit.com",
-            "twitter": "https://twitter.com"
+            "twitter": "https://twitter.com",
+            "youtube": "https://www.youtube.com",
         }
-        target_url = urls.get(service.lower(), f"https://www.{service}.com")
+        key = service.lower().strip()
+        target_url = urls.get(key)
+        if target_url is None:
+            # S-9: sin fallback a https://www.{service}.com. Un error de
+            # tipeo por voz ("abrí spotifi") abría un dominio arbitrario
+            # que cualquiera puede registrar (typosquatting).
+            known = ", ".join(sorted(urls))
+            msg = f"No tengo registrado el servicio '{service}'. Los que conozco son: {known}."
+            return {"status": "error", "message": msg}
+        if key == "youtube":
+            # YouTube SIEMPRE en Brave, nunca en el navegador por defecto (podría ser Chrome)
+            if self._open_url_in_brave(target_url):
+                msg = "Abriendo Youtube en Brave."
+                state_mgr.emit_tool_call("open_web_service", {"service": service, "url": target_url, "browser": "brave"}, msg)
+                return {"status": "success", "message": msg, "url": target_url, "browser": "brave"}
+            log_warning("[open_web_service] No se encontró Brave; se abre YouTube con el navegador por defecto.")
         webbrowser.open(target_url)
         msg = f"Abriendo {service.capitalize()}."
         state_mgr.emit_tool_call("open_web_service", {"service": service, "url": target_url}, msg)
@@ -2422,11 +3175,14 @@ class SystemControl:
                 p.kill()
                 killed.append(f"{p_name} (PID: {pid})")
             else:
-                target_name = clean if clean.endswith(".exe") else f"{clean}.exe"
+                # S-2: match EXACTO, sin subcadena. Antes `clean in n` hacía
+                # que "mata chrome" matara también chrome_updater.exe,
+                # chrome_installer, etc. Solo el nombre exacto (con o sin .exe).
+                wanted = {clean, f"{clean}.exe"} if not clean.endswith(".exe") else {clean, clean[:-4]}
                 for p in psutil.process_iter(['pid', 'name']):
                     try:
                         n = p.info['name'].lower()
-                        if n == target_name or clean in n:
+                        if n in wanted:
                             if n not in protected:
                                 p.kill()
                                 killed.append(f"{p.info['name']} (PID: {p.info['pid']})")
@@ -2479,7 +3235,13 @@ class SystemControl:
             res = run_silent(cmd, capture_output=True, text=True, timeout=8)
             out = res.stdout
 
-            loss_match = re.search(r'\((\d+)%\s*(?:perdidos|loss)\)', out, re.IGNORECASE)
+            # B-18: la pérdida venía solo en formato Windows "(0% perdidos)".
+            # En Linux el formato es "0% packet loss" sin paréntesis y nunca
+            # matcheaba: siempre informaba 0% aunque hubiera pérdida real.
+            loss_match = (
+                re.search(r'\((\d+)%\s*(?:perdidos|pérdida|loss)\)', out, re.IGNORECASE)
+                or re.search(r'(\d+)%\s*(?:packet loss|paquetes perdidos|pérdida de paquetes)', out, re.IGNORECASE)
+            )
             loss_pct = int(loss_match.group(1)) if loss_match else 0
 
             avg_match = re.search(r'(?:Media|Average)\s*=\s*(\d+)\s*ms', out, re.IGNORECASE)
@@ -2613,6 +3375,97 @@ class SystemControl:
             "message": msg
         }
 
+    # P0-4 — Límites para la descarga de imágenes de fondo de pantalla.
+    # Antes se usaba urlretrieve sin timeout, sin límite de tamaño y sin
+    # verificar que lo descargado fuera realmente una imagen.
+    WALLPAPER_MAX_BYTES = 25 * 1024 * 1024  # 25 MB
+    WALLPAPER_TIMEOUT = 15  # segundos
+
+    @staticmethod
+    def _detect_image_kind(data: bytes) -> str | None:
+        """Detecta el tipo de imagen por magic bytes. None si no es imagen."""
+        if data[:3] == b"\xff\xd8\xff":
+            return "jpg"
+        if data[:8] == b"\x89PNG\r\n\x1a\n":
+            return "png"
+        if data[:6] in (b"GIF87a", b"GIF89a"):
+            return "gif"
+        if data[:2] == b"BM":
+            return "bmp"
+        if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+            return "webp"
+        return None
+
+    def _download_wallpaper_image(self, url: str) -> str:
+        """Descarga una imagen para fondo de pantalla con validaciones P0-4.
+
+        - Solo http/https con host (defensa en profundidad: el servidor ya
+          valida la URL en /api/pc/wallpaper/set).
+        - Timeout de conexión/lectura.
+        - Tamaño máximo (corta la descarga si se excede).
+        - Content-Type debe ser image/* (si el servidor lo informa).
+        - Verifica magic bytes: lo descargado tiene que ser una imagen real.
+        - Verificación extra con PIL si está disponible (opcional en el
+          paquete mínimo del satélite).
+
+        Devuelve la ruta local del archivo. Lanza ValueError si algo falla.
+        Es independiente de la plataforma para poder testearse en Linux.
+        """
+        import tempfile
+        import urllib.request
+        from urllib.parse import urlparse
+
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise ValueError("URL de imagen inválida: solo se permiten http/https")
+
+        req = urllib.request.Request(url, headers={"User-Agent": "Titan/1.0"})
+        try:
+            resp = urllib.request.urlopen(req, timeout=self.WALLPAPER_TIMEOUT)
+        except Exception as e:
+            raise ValueError(f"No se pudo descargar la imagen: {e}")
+
+        with resp:
+            content_type = (resp.headers.get("Content-Type", "") or "").split(";")[0].strip().lower()
+            if content_type and not content_type.startswith("image/"):
+                raise ValueError(f"La URL no devolvió una imagen (Content-Type: {content_type or 'desconocido'})")
+
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                chunk = resp.read(65536)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > self.WALLPAPER_MAX_BYTES:
+                    raise ValueError(
+                        f"La imagen supera el tamaño máximo de {self.WALLPAPER_MAX_BYTES // (1024 * 1024)} MB"
+                    )
+                chunks.append(chunk)
+        data = b"".join(chunks)
+        if not data:
+            raise ValueError("La descarga llegó vacía")
+
+        kind = self._detect_image_kind(data)
+        if not kind:
+            raise ValueError("Lo descargado no es una imagen válida")
+
+        # Verificación extra con PIL si está instalado (no es obligatorio
+        # en el paquete mínimo del satélite).
+        try:
+            from PIL import Image
+            import io
+            with Image.open(io.BytesIO(data)) as img:
+                img.verify()
+        except ImportError:
+            pass
+        except Exception as e:
+            raise ValueError(f"La imagen está corrupta o no se pudo leer: {e}")
+
+        temp_file = Path(tempfile.gettempdir()) / f"titan_wallpaper.{kind}"
+        temp_file.write_bytes(data)
+        return str(temp_file)
+
     def set_wallpaper(self, image_path_or_url: str) -> Dict[str, Any]:
         """Establece una imagen como fondo de pantalla de Windows"""
         if sys.platform != "win32":
@@ -2620,11 +3473,10 @@ class SystemControl:
         try:
             target_path = image_path_or_url
             if image_path_or_url.startswith("http://") or image_path_or_url.startswith("https://"):
-                import urllib.request
-                import tempfile
-                temp_file = Path(tempfile.gettempdir()) / "titan_wallpaper.jpg"
-                urllib.request.urlretrieve(image_path_or_url, str(temp_file))
-                target_path = str(temp_file)
+                try:
+                    target_path = self._download_wallpaper_image(image_path_or_url)
+                except ValueError as e:
+                    return {"status": "error", "message": str(e)}
 
             if not os.path.exists(target_path):
                 return {"status": "error", "message": f"Archivo de imagen no encontrado: {target_path}"}

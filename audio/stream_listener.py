@@ -3,9 +3,14 @@ import time
 import numpy as np
 import speech_recognition as sr
 from typing import Callable, Optional
+from concurrent.futures import ThreadPoolExecutor
 from core.logger import log_info, log_warning, log_error
 from core.state_manager import state_mgr, AssistantState
 from audio.wake_word import wake_detector
+
+# Huella de voz (2026-09-17): pool chico para pedir el embedding al satélite
+# EN PARALELO con el reconocimiento de voz, sin frenar la respuesta.
+_HUELLAPOOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="huella")
 
 class StreamAudioListener:
     def __init__(self):
@@ -146,6 +151,37 @@ class StreamAudioListener:
                 self.silence_counter = 0
 
     def _recognize_and_dispatch(self, audio_bytes: bytes):
+        # 2026-09-17 — Huella de voz: si hay un registro en curso ("registrá
+        # mi voz"), el audio va al enroller: no se transcribe ni se procesa
+        # como orden.
+        try:
+            from audio.speaker_id import enrollment_active, handle_enrollment_audio
+            if enrollment_active():
+                try:
+                    prompt = handle_enrollment_audio(audio_bytes, self.sample_rate, self._loop)
+                    if prompt and self._loop:
+                        from audio.tts import tts
+                        asyncio.run_coroutine_threadsafe(tts.speak(prompt, auto_listen=True), self._loop)
+                finally:
+                    self._is_processing = False
+                return
+        except Exception as ex:
+            log_warning(f"[Huella] error en registro: {ex}")
+            self._is_processing = False
+            return
+
+        # 2026-09-17 — Huella de voz: pedir el embedding al satélite EN
+        # PARALELO con el STT (no suma latencia: el satélite tarda menos
+        # que Google en devolver el texto). Solo si hay huella registrada.
+        huella_future = None
+        try:
+            from audio import speaker_id as huella
+            if huella.list_voiceprints() and self._loop is not None:
+                huella_future = _HUELLAPOOL.submit(
+                    huella.fetch_embedding, audio_bytes, self.sample_rate, self._loop, 5.0)
+        except Exception:
+            huella_future = None
+
         try:
             audio = sr.AudioData(audio_bytes, self.sample_rate, self.sample_width)
             text = self.recognizer.recognize_google(audio, language="es-AR")
@@ -166,6 +202,19 @@ class StreamAudioListener:
             if tts.is_self_echo(text):
                 log_info(f"[Mic Celular Anti-Eco] Audio descartado por ser eco de Titán: '{text}'")
                 return
+
+            # 2026-09-17 — Huella de voz: el embedding ya debería estar listo
+            # (corrió en paralelo); comparar acá para que el cerebro sepa
+            # QUIÉN habla antes de responder.
+            if huella_future is not None:
+                try:
+                    from audio import speaker_id as huella
+                    emb = huella_future.result(timeout=4.0)
+                    if emb:
+                        identity, score = huella.match_embedding(emb)
+                        state_mgr.set_speaker_identity(identity, score)
+                except Exception:
+                    pass
 
             now = time.time()
             from audio.speaker_monitor import speaker_monitor
@@ -192,7 +241,20 @@ class StreamAudioListener:
                 if remainder:
                     self.is_waiting_for_command = False
                     if self._loop and self._on_command_callback:
-                        asyncio.run_coroutine_threadsafe(self._on_command_callback(remainder), self._loop)
+                        fut = asyncio.run_coroutine_threadsafe(self._on_command_callback(remainder), self._loop)
+                        # B-14: igual que en listener.py — restaurar el volumen
+                        # cuando la orden termina de procesarse (este archivo
+                        # ni siquiera tenía un unduck en el camino de éxito).
+                        def _restore_volume(f):
+                            try:
+                                f.result()  # consume la excepción si la hubo
+                            except Exception:
+                                pass
+                            try:
+                                speaker_monitor.unduck()
+                            except Exception:
+                                pass
+                        fut.add_done_callback(_restore_volume)
                 else:
                     self.is_waiting_for_command = True
                     self.command_wait_expires = time.time() + 12.0

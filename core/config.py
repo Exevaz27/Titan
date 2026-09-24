@@ -8,7 +8,18 @@ from dotenv import load_dotenv
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 # Cargar variables de entorno desde .env
-load_dotenv(BASE_DIR / ".env")
+_env_path = BASE_DIR / ".env"
+load_dotenv(_env_path)
+# S-14: el .env guarda la API key; si quedó legible para otros usuarios
+# del sistema, se ajusta a 600 en cada arranque.
+try:
+    if _env_path.exists():
+        _mode = _env_path.stat().st_mode & 0o777
+        if _mode & 0o077:
+            os.chmod(_env_path, 0o600)
+            print(f"[Seguridad] Permisos de .env ajustados a 600 (estaban en {oct(_mode)}).")
+except Exception:
+    pass
 
 class Config:
     def __init__(self):
@@ -21,6 +32,9 @@ class Config:
         self.gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
         self.server_host: str = os.getenv("SERVER_HOST", "0.0.0.0").strip()
         self.server_port: int = int(os.getenv("SERVER_PORT", "8000").strip())
+        # S-11: puerto solo-TLS para el canal del satélite (wss://). El 8000
+        # queda intacto para HUD/navegadores.
+        self.satellite_tls_port: int = int(os.getenv("SATELLITE_TLS_PORT", "8443").strip())
         self.telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
         self.telegram_allowed_user_id: str = os.getenv("TELEGRAM_ALLOWED_USER_ID", "").strip()
         self.hf_token: str = os.getenv("HF_TOKEN", "").strip()

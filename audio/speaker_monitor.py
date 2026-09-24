@@ -18,6 +18,10 @@ class SpeakerMonitor:
         self._cached_peak = 0.0
         self._last_spotify_check = 0.0
         self._cached_spotify_playing = False
+        # B-11: en la DDR3 (Linux) pycaw no existe y la música suena en la PC
+        # Windows, así que el valor viene del satélite (hilo poller, cacheado).
+        self._cached_remote_media_active = False
+        self._remote_media_poller_started = False
 
     def get_speaker_peak(self) -> float:
         """Retorna el pico actual del sonido que sale por los parlantes (0.0 a 1.0)"""
@@ -75,11 +79,62 @@ class SpeakerMonitor:
 
     def is_media_active(self) -> bool:
         """True si hay musica o sonido saliendo por los parlantes (Spotify, YouTube, juegos, etc.)"""
-        return self.is_spotify_playing() or self.get_speaker_peak() > 0.035
+        if os.name == 'nt':
+            return self.is_spotify_playing() or self.get_speaker_peak() > 0.035
+        # B-11: en la DDR3 (Linux) pycaw no existe y la música suena en la PC
+        # Windows → se usa el valor cacheado que reporta el satélite. Nunca
+        # bloquea: es una simple lectura (seguro en cualquier hilo).
+        self._ensure_remote_media_poller()
+        return self._cached_remote_media_active
+
+    def _ensure_remote_media_poller(self):
+        """B-11: lanza (una sola vez) el hilo que pregunta al satélite cada 10s
+        si hay audio sonando en la PC."""
+        if self._remote_media_poller_started:
+            return
+        self._remote_media_poller_started = True
+        t = threading.Thread(
+            target=self._remote_media_poll_loop,
+            name="titan-remote-media",
+            daemon=True,
+        )
+        t.start()
+
+    def _remote_media_poll_loop(self):
+        """Hilo dedicado: consulta no bloqueante al satélite (este hilo SÍ
+        puede esperar con fut.result(); nunca es el hilo del event loop)."""
+        from core.state_manager import state_mgr
+        from server.websocket_hub import ws_hub
+        import asyncio
+        loop = None
+        while loop is None:
+            loop = getattr(state_mgr, "_loop", None)
+            if loop is None:
+                time.sleep(1.0)
+        while True:
+            try:
+                fut = asyncio.run_coroutine_threadsafe(
+                    ws_hub.call_remote("is_media_active", {}, timeout=4.0),
+                    loop,
+                )
+                res = fut.result(timeout=5.0)
+                self._cached_remote_media_active = (
+                    bool(res.get("media_active", False))
+                    if isinstance(res, dict) else False
+                )
+            except Exception:
+                # Satélite caído o sin respuesta → como antes del fix:
+                # se asume que no hay música.
+                self._cached_remote_media_active = False
+            time.sleep(10.0)
 
     def duck(self, target_volume: float = 0.15):
         """Atenua la musica para que el microfono escuche al usuario con nitidez"""
         if os.name != 'nt':
+            # B-11: no molestar al satélite atenuando si no hay música
+            # sonando en la PC (antes se mandaba siempre).
+            if not self.is_media_active():
+                return
             try:
                 from server.websocket_hub import ws_hub
                 from core.state_manager import state_mgr

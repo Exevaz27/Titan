@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import hmac
 import os
-from typing import Optional
 
 from core.device_registry import registry
 from core.logger import log_warning
 
-LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
+# P0: se eliminó el bypass de autenticación para loopback. TODA conexión
+# HTTP/WebSocket necesita credencial válida, venga de donde venga
+# (localhost, LAN o Tailscale). Cualquiera en la LAN es una amenaza potencial.
 
 
 def _token_from_headers(headers) -> str:
@@ -43,10 +44,6 @@ def _expected_token(role: str) -> str:
     return os.getenv("TITAN_API_TOKEN", "").strip()
 
 
-def _is_loopback(host: Optional[str]) -> bool:
-    return (host or "").strip().lower() in LOOPBACK_HOSTS
-
-
 def token_is_valid(token: str, role: str) -> bool:
     expected = _expected_token(role)
     return bool(expected and token and hmac.compare_digest(token, expected))
@@ -61,17 +58,84 @@ def device_auth_is_required() -> bool:
 
 
 def device_is_valid(device_id: str, token: str, roles: tuple[str, ...]) -> bool:
-    return bool(device_id and token and any(registry.verify(device_id, token, role) for role in roles))
+    # S-4: el rol "admin" implica "api" en la capa de transporte. Todo lo que
+    # pide rol "api" (middleware de /api/*, HUD, /ws) acepta también admin;
+    # lo que pide rol "admin" explícito (/api/admin/*, /admin) sigue siendo
+    # exclusivo de admin.
+    effective = set(roles)
+    if "api" in effective:
+        effective.add("admin")
+    return bool(device_id and token and any(registry.verify(device_id, token, role) for role in effective))
+
+
+def api_devices_exist() -> bool:
+    """True si hay al menos un dispositivo habilitado con rol 'api'.
+
+    Se usa al arrancar: si no hay ninguno, se genera un código de
+    configuración inicial en consola para emparejar el primer navegador/HUD.
+    """
+    try:
+        devices = registry.list_devices()
+    except Exception:
+        return False
+    return any(
+        "api" in d.get("roles", []) and d.get("enabled", True)
+        for d in devices.values()
+        if isinstance(d, dict)
+    )
+
+
+def admin_devices_exist() -> bool:
+    """S-4: True si hay al menos un dispositivo habilitado con rol 'admin'."""
+    try:
+        devices = registry.list_devices()
+    except Exception:
+        return False
+    return any(
+        "admin" in d.get("roles", []) and d.get("enabled", True)
+        for d in devices.values()
+        if isinstance(d, dict)
+    )
+
+
+def ensure_admin_role() -> int:
+    """S-4 (migración, idempotente): si ningún dispositivo tiene rol 'admin',
+    se lo otorga a cada dispositivo habilitado con rol 'api'.
+
+    Antes de S-4 todos los 'api' podían gestionar dispositivos desde /admin
+    (eran igual de confiables); la migración conserva ese acceso existente
+    mientras el rol queda establecido para el futuro (los dispositivos nuevos
+    se enrolan con el rol mínimo). Devuelve cuántos se promovieron.
+    """
+    try:
+        devices = registry.list_devices()
+    except Exception:
+        return 0
+    if admin_devices_exist():
+        return 0
+    promoted = 0
+    for device_id, d in devices.items():
+        if (
+            isinstance(d, dict)
+            and "api" in d.get("roles", [])
+            and d.get("enabled", True)
+            and registry.grant_role(device_id, "admin")
+        ):
+            promoted += 1
+    if promoted:
+        log_warning(
+            f"[Seguridad] S-4: {promoted} dispositivo(s) 'api' recibieron el rol "
+            "'admin' (migración por única vez; los nuevos se enrolan con rol mínimo)."
+        )
+    return promoted
 
 
 def authorize_http(request: Request, role: str = "api") -> None:
     from fastapi import HTTPException, status
 
-    client_host = request.client.host if request.client else None
+    # P0: sin bypass de loopback. Sin credencial válida no hay acceso.
     token = _token_from_headers(request.headers)
     device_id = _device_id_from_headers(request.headers)
-    if _is_loopback(client_host) and not token:
-        return
     if device_auth_is_required() and device_is_valid(device_id, token, (role,)):
         return
     if device_auth_is_required():
@@ -89,27 +153,24 @@ def authorize_http(request: Request, role: str = "api") -> None:
 async def authorize_websocket(websocket: WebSocket, role: str = "api") -> None:
     from fastapi import WebSocketException
 
-    client_host = websocket.client.host if websocket.client else None
+    # P0: sin bypass de loopback y sin tokens en query strings (quedan en
+    # historial/logs). Solo headers o cookies.
     token = _token_from_headers(websocket.headers)
     device_id = _device_id_from_headers(websocket.headers)
-    if not token:
-        token = websocket.query_params.get("token", "").strip()
-    if not device_id:
-        device_id = websocket.query_params.get("device_id", "").strip()
-    if _is_loopback(client_host) and not token:
-        return
     valid_roles = ("api", "satellite") if role == "ws" else (role,)
     if device_auth_is_required() and device_is_valid(device_id, token, valid_roles):
         return
     if device_auth_is_required():
+        client_host = websocket.client.host if websocket.client else None
         log_warning(
             f"[Seguridad] WebSocket rechazado: host={client_host or 'desconocido'}, "
             f"device_id={device_id or 'ausente'}, token={'presente' if token else 'ausente'}, "
             f"roles={','.join(valid_roles)}"
         )
-        await websocket.close(code=1008, reason="Dispositivo no autorizado")
+        # P0: no cerrar el socket acá. Al lanzar WebSocketException, el
+        # manejador interno de Starlette lo cierra con ese código/motivo.
+        # (Cerrar antes del raise provocaba doble close -> RuntimeError.)
         raise WebSocketException(code=1008, reason="Dispositivo no autorizado")
     if token_is_valid_for_roles(token, valid_roles):
         return
-    await websocket.close(code=1008, reason="Autenticación requerida")
     raise WebSocketException(code=1008, reason="Autenticación requerida")

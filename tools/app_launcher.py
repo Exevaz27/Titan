@@ -74,33 +74,61 @@ class AppLauncher:
 
         log_info(f"Índice de aplicaciones actualizado ({len(self._cached_apps)} programas detectados)")
 
-    def find_app(self, query: str) -> Optional[Tuple[str, str]]:
-        """Busca una app por nombre exacto o aproximado. Retorna (nombre, ruta)"""
+    def find_candidates(self, query: str) -> List[Tuple[str, str]]:
+        """Todas las apps candidatas para un nombre, en orden de confianza."""
         q = query.lower().strip()
-
-        # Coincidencia exacta
+        if not q:
+            return []
         if q in self._cached_apps:
-            return q, self._cached_apps[q]
+            return [(q, self._cached_apps[q])]
+        # Subcadena solo en la dirección segura: lo pedido dentro del nombre
+        # de la app. La dirección inversa ("a" en "calculadora") abría
+        # cualquier cosa.
+        partial = [(name, path) for name, path in self._cached_apps.items() if q in name]
+        if partial:
+            return partial
+        # Difusa con cutoff exigente (antes 0.5: "word" matcheaba "world").
+        fuzzy = difflib.get_close_matches(q, list(self._cached_apps.keys()), n=3, cutoff=0.75)
+        return [(name, self._cached_apps[name]) for name in fuzzy]
 
-        # Coincidencia parcial (subcadena)
-        for name, path in self._cached_apps.items():
-            if q in name or name in q:
-                return name, path
+    def find_app(self, query: str) -> Optional[Tuple[str, str]]:
+        """Busca una app por nombre exacto o aproximado. Retorna (nombre, ruta).
 
-        # Coincidencia difusa
-        matches = difflib.get_close_matches(q, list(self._cached_apps.keys()), n=1, cutoff=0.5)
-        if matches:
-            best = matches[0]
-            return best, self._cached_apps[best]
-
+        Solo devuelve un resultado si es inequívoco; si hay varias candidatas
+        devuelve None para que el llamador desambigüe en vez de abrir la
+        primera que aparezca.
+        """
+        candidates = self.find_candidates(query)
+        if len(candidates) == 1:
+            return candidates[0]
         return None
 
     def launch_app(self, app_name: str) -> Dict[str, Any]:
         """Abre una aplicación por nombre"""
+        # B-22: en Linux os.startfile no existe y las apps viven en la PC Windows:
+        # delegar al satélite por RPC en vez de reventar con AttributeError.
+        if os.name != 'nt':
+            from tools.system_control import system_control
+            remote_res = system_control._remote_exec_if_linux(
+                "launch_app", {"app_name": app_name},
+                f"Ahí te abro {app_name} en la compu, papá.")
+            if remote_res:
+                return remote_res
         state_mgr.set_state(AssistantState.EXECUTING_TOOL, f"Abriendo {app_name}...")
         log_info(f"Intentando abrir aplicación: '{app_name}'")
 
         match = self.find_app(app_name)
+        if not match:
+            # B-23: si hay varias candidatas no se abre la primera a ciegas:
+            # se pregunta cuál quiso decir.
+            candidates = self.find_candidates(app_name)
+            if len(candidates) > 1:
+                names = ", ".join(f"'{n}'" for n, _ in candidates[:5])
+                amb_msg = f"Encontré varias parecidas a '{app_name}': {names}. ¿Cuál abro?"
+                log_warning(amb_msg)
+                state_mgr.emit_tool_call("launch_app", {"app_name": app_name}, amb_msg)
+                return {"status": "ambiguous", "message": amb_msg,
+                        "candidates": [n for n, _ in candidates]}
         if match:
             matched_name, path = match
             try:

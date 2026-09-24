@@ -8,14 +8,14 @@
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="theme-color" content="#000000">
   <link rel="manifest" href="/static/manifest.json">
-  <link rel="stylesheet" href="/static/style.css?v=50">
+  <link rel="stylesheet" href="/static/style.css?v=67">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;600;800&family=Outfit:wght@300;400;600;700&display=swap" rel="stylesheet">
 </head>
 <body class="state-idle active-view-face">
 
-  <!-- Selector de Vistas Superior (Conmutable por voz o toque) -->
+  <!-- Barra superior única: vistas + modo + escucha (2026-09-17) -->
   <nav class="view-nav" id="viewNav">
     <button class="nav-tab active" data-view="face" id="tabFace">
       <span class="tab-icon">👤</span>
@@ -29,46 +29,53 @@
       <span class="tab-icon">⚡</span>
       <span class="tab-label">RECURSOS</span>
     </button>
-    <button class="nav-tab" id="btnFullscreen" title="Pantalla Completa" style="padding: 0.4rem 0.6rem;">
-      <span>⛶</span>
-    </button>
-    <button class="nav-tab" id="btnMuteAudio" title="Voz silenciada en esta pantalla (sale por Servidor Titán DDR3). Clic para escucharla acá." style="padding: 0.4rem 0.6rem; color: var(--neon-red); border-color: rgba(255, 51, 102, 0.5);">
-      <span id="muteAudioIcon">🔇</span>
-    </button>
-    <button class="nav-tab nav-btn-handsfree" id="navBtnHandsFree" title="Activar escucha permanente de voz" style="color: var(--neon-green); border-color: rgba(0, 255, 136, 0.4); margin-left: 0.3rem;">
+    <div class="mode-select" id="modeSelect">
+      <button class="mode-current" id="modeCurrent" aria-haspopup="true" aria-expanded="false" title="Cambiar modo de personalidad">
+        <span class="mode-current-dot" id="modeCurrentDot">🟢</span>
+        <span class="mode-current-label" id="modeCurrentLabel">COMPINCHE</span>
+        <span class="mode-current-chev">▾</span>
+      </button>
+      <div class="mode-menu" id="modeMenu" role="menu">
+        <button class="mode-pill mode-opt active" data-mode="normal" title="Modo Normal: Compinche de fierro (La Boca)">
+          <span class="mode-indicator dot-normal"></span>
+          <span class="mode-label">🟢 COMPINCHE</span>
+          <span class="mode-tick">✓</span>
+        </button>
+        <button class="mode-pill mode-opt" data-mode="kids" title="Modo Pibes: Hermano mayor caprichoso (ATP - Cero malas palabras)">
+          <span class="mode-indicator dot-kids"></span>
+          <span class="mode-label">🟡 PIBES (ATP)</span>
+          <span class="mode-tick">✓</span>
+        </button>
+        <button class="mode-pill mode-opt" data-mode="rebel" title="Modo Rebelde: Sin filtro / Adultos (Puteador)">
+          <span class="mode-indicator dot-rebel"></span>
+          <span class="mode-label">🔴 REBELDE</span>
+          <span class="mode-tick">✓</span>
+        </button>
+        <button class="mode-pill mode-opt" data-mode="termo" title="Modo Termo: Folclore futbolero, debate picante y pasión bostera">
+          <span class="mode-indicator dot-termo"></span>
+          <span class="mode-label">⚽ MODO TERMO</span>
+          <span class="mode-tick">✓</span>
+        </button>
+        <button class="mode-pill mode-opt" data-mode="pollera" title="Modo Pollera: gobernado por Oriana, la jefa manda">
+          <span class="mode-indicator dot-pollera"></span>
+          <span class="mode-label">🌸 MODO POLLERA</span>
+          <span class="mode-tick">✓</span>
+        </button>
+      </div>
+    </div>
+    <button class="nav-tab nav-btn-handsfree" id="navBtnHandsFree" title="Activar escucha permanente de voz" aria-label="Activar escucha permanente de voz">
       <span id="navHandsFreeIcon">👂</span>
       <span id="navHandsFreeLabel">MANOS LIBRES</span>
     </button>
-    <div class="nav-status-pill" id="connStatus">
-      <span class="dot"></span>
-      <span class="status-txt" id="connText">ON</span>
-    </div>
-  </nav>
-
-  <!-- Barra Superior de Modos de Personalidad (Compinche / Pibes / Rebelde) -->
-  <div class="mode-bar-container" id="modeBar">
-    <div class="mode-selector-group">
-      <button class="mode-pill active" id="btnModeNormal" data-mode="normal" title="Modo Normal: Compinche de fierro (La Boca)">
-        <span class="mode-indicator dot-normal"></span>
-        <span class="mode-label">🟢 COMPINCHE</span>
-      </button>
-      <button class="mode-pill" id="btnModeKids" data-mode="kids" title="Modo Pibes: Hermano mayor caprichoso (ATP - Cero malas palabras)">
-        <span class="mode-indicator dot-kids"></span>
-        <span class="mode-label">🟡 PIBES (ATP)</span>
-      </button>
-      <button class="mode-pill" id="btnModeRebel" data-mode="rebel" title="Modo Rebelde: Sin filtro / Adultos (Puteador)">
-        <span class="mode-indicator dot-rebel"></span>
-        <span class="mode-label">🔴 REBELDE</span>
-      </button>
-      <button class="mode-pill" id="btnModeTertulia" data-mode="tertulia" title="Modo Termo: Folclore futbolero, debate picante y pasión bostera">
-        <span class="mode-indicator dot-tertulia"></span>
-        <span class="mode-label">⚽ MODO TERMO</span>
-      </button>
-    </div>
     <div class="speaker-pill" id="speakerBadge" title="Interlocutor acústico detectado por tono">
       <span class="speaker-icon" id="speakerIcon">🎙️</span>
       <span class="speaker-name" id="speakerName">Voz: Auto</span>
     </div>
+  </nav>
+
+  <!-- Icono de conexión en esquina inferior (2026-09-17) -->
+  <div class="conn-corner" id="connStatus" title="Estado de conexión">
+    <span class="dot"></span>
   </div>
 
   <!-- ============================================================ -->
@@ -90,6 +97,7 @@
       </svg>
 
       <!-- Rostro Base de Titán -->
+      <div class="face-scale" id="faceScale">
       <div id="cara">
         <!-- Capa de Zzz para modo siesta (Etapa 3) -->
         <div class="zzz-layer" id="zzzLayer">
@@ -98,11 +106,11 @@
           <span class="zzz-particle zzz-3">Z</span>
         </div>
 
-        <div class="anger-mark" id="angerMark">💢</div>
-        <div class="steam steam-left" id="steamLeft">💨</div>
-        <div class="steam steam-right" id="steamRight">💨</div>
-        <div class="ceja izq" id="eyebrowLeft"></div>
-        <div class="ceja der" id="eyebrowRight"></div>
+        <div class="anger-mark" id="angerMark"><i></i><i></i><i></i><i></i></div>
+        <div class="steam steam-left" id="steamLeft"><i></i><i></i><i></i></div>
+        <div class="steam steam-right" id="steamRight"><i></i><i></i><i></i></div>
+        <div class="ceja izq eyebrow" id="eyebrowLeft"></div>
+        <div class="ceja der eyebrow" id="eyebrowRight"></div>
         <div class="ojo izq" id="eyeLeft">
           <div class="eye-closed-curve"></div>
           <svg class="eyelid-arc-svg" viewBox="0 0 46 58">
@@ -116,6 +124,27 @@
           </svg>
         </div>
         <div class="boca" id="mouthMesh"></div>
+        <span class="puntos-piensa" aria-hidden="true"><i></i><i></i><i></i></span>
+
+        <!-- Modo pollera (2026-09-18): corazoncito insignia, ojos tiernos y corazones flotantes.
+             Solo se muestran con la voz de Oriana; en reposo/hablando otro la cara es la normal. -->
+        <div class="heart-pin" aria-hidden="true">♥</div>
+        <svg class="love-eyes" viewBox="0 0 144 52" aria-hidden="true">
+          <path d="M 8,38 Q 29,8 50,38" fill="none" stroke="var(--state-color, var(--color-anillo))" stroke-width="6" stroke-linecap="round"/>
+          <path d="M 94,38 Q 115,8 136,38" fill="none" stroke="var(--state-color, var(--color-anillo))" stroke-width="6" stroke-linecap="round"/>
+        </svg>
+        <div class="float-hearts" aria-hidden="true"><span class="fh f1">♥</span><span class="fh f2">♥</span></div>
+
+        <!-- Gorrito, mejillas y burbuja de sueño: solo visibles en stage-sleeping -->
+        <svg class="gorrito" viewBox="0 0 156 82" aria-hidden="true">
+          <path d="M27 55 Q64 10 116 37 Q111 45 99 55 Z" fill="rgba(0, 240, 255, .09)" stroke="rgba(0, 240, 255, .68)" stroke-width="3" stroke-linejoin="round"/>
+          <path d="M115 37 Q128 39 133 24" fill="none" stroke="rgba(0, 240, 255, .58)" stroke-width="3" stroke-linecap="round"/>
+          <circle cx="135" cy="20" r="8" fill="rgba(0, 240, 255, .13)" stroke="rgba(0, 240, 255, .68)" stroke-width="3"/>
+          <path d="M20 56 Q63 48 107 56" fill="none" stroke="#00f0ff" stroke-opacity=".72" stroke-width="6" stroke-linecap="round"/>
+        </svg>
+        <span class="mejilla izq" aria-hidden="true"></span>
+        <span class="mejilla der" aria-hidden="true"></span>
+        <span class="burbuja-sueno" aria-hidden="true"></span>
 
         <!-- Capa de Mate y Pava Matera (Etapa 1: Recreo) -->
         <div class="mate-scene-layer" id="mateSceneLayer">
@@ -134,13 +163,21 @@
 
             <!-- Pava Matera desde la izquierda pivotando sobre su pico -->
             <g id="kettleLeftGroup">
-              <path d="M 62,192 C 72,204 68,218 54,222 C 38,226 22,220 16,208 C 12,198 22,190 32,188 Z" fill="#00081a" stroke="var(--state-color, #00d4ff)" stroke-width="2.5" />
-              <ellipse cx="42" cy="186" rx="10" ry="3.5" fill="#00142e" stroke="#ffffff" stroke-width="1.8" />
-              <circle cx="42" cy="182" r="2.5" fill="#ffffff" />
-              <path d="M 58,202 Q 82,204 96,218 Q 86,220 70,212" fill="#00081a" stroke="var(--state-color, #00d4ff)" stroke-width="2.2" stroke-linecap="round" />
-              <ellipse cx="96" cy="218" rx="2" ry="1.2" fill="#ffffff" />
-              <path d="M 52,186 C 56,168 26,168 30,186" fill="none" stroke="#ffffff" stroke-width="3" stroke-linecap="round" />
-              <path d="M 52,186 C 56,168 26,168 30,186" fill="none" stroke="var(--state-color, #00d4ff)" stroke-width="1.2" stroke-linecap="round" />
+              <ellipse cx="48" cy="233" rx="26" ry="3.5" fill="rgba(0, 212, 255, 0.15)" />
+              <g class="pava-glug">
+                <path d="M 44,188 C 30,190 18,200 18,212 C 18,224 32,231 48,231 C 64,231 76,224 77,213 C 78,205 72,197 64,193 C 58,190 50,187 44,188 Z" fill="#00081a" stroke="var(--state-color, #00d4ff)" stroke-width="2.5" />
+                <path d="M 20,214 Q 48,222 75,215" fill="none" stroke="rgba(0, 212, 255, 0.5)" stroke-width="1.6" />
+                <path d="M 21,218 Q 48,226 74,219" fill="none" stroke="#ffffff" stroke-width="1" opacity="0.5" />
+                <path d="M 30,204 Q 35,216 48,221" fill="none" stroke="#ffffff" stroke-width="2.5" stroke-linecap="round" opacity="0.35" />
+                <ellipse cx="48" cy="187" rx="13" ry="4.2" fill="#00142e" stroke="#ffffff" stroke-width="1.8" />
+                <circle cx="48" cy="181.5" r="3.2" fill="#ffffff" filter="drop-shadow(0 0 3px #00d4ff)" />
+                <path d="M 66,196 Q 82,200 95,213 L 98,220 Q 84,208 64,204 Z" fill="#00081a" stroke="var(--state-color, #00d4ff)" stroke-width="2" stroke-linejoin="round" />
+                <ellipse cx="96" cy="218" rx="2.2" ry="1.4" fill="#ffffff" />
+                <path d="M 60,186 C 64,164 32,164 36,186" fill="none" stroke="#ffffff" stroke-width="3" stroke-linecap="round" />
+                <path d="M 60,186 C 64,164 32,164 36,186" fill="none" stroke="var(--state-color, #00d4ff)" stroke-width="1.2" stroke-linecap="round" />
+                <circle cx="60" cy="186" r="1.8" fill="#ffffff" />
+                <circle cx="36" cy="186" r="1.8" fill="#ffffff" />
+              </g>
             </g>
 
             <!-- Mate y Bombilla criolla (Ángulo natural ~14°, casi vertical saliendo hacia la boca) -->
@@ -161,7 +198,7 @@
               </g>
 
               <!-- Pico de la bombilla apoyado en la boca a -14° -->
-              <g transform="translate(100, 198) rotate(-14)">
+              <g class="bombilla-tip" transform="translate(100, 198) rotate(-14)">
                 <path d="M -3,-1 L 3,-1 L 2.5,5 L -2.5,5 Z" fill="#ffffff" stroke="var(--state-color, #00d4ff)" stroke-width="1.2" filter="drop-shadow(0 0 3px #00d4ff)" />
                 <ellipse cx="0" cy="-1" rx="2.8" ry="1.1" fill="#00081a" stroke="#ffffff" stroke-width="0.8" />
               </g>
@@ -181,6 +218,288 @@
             </g>
           </svg>
         </div>
+
+        <!-- Capa de Bebidas bien de barrio (Etapa 1b: finde a la noche o por voz).
+             Del pico: la botella se inclina directo a la boca, sin vaso.
+             Tres variantes (solo una visible a la vez, la elige el JS):
+             fernet (oscura), birra (verde litro), vino con coca (plástica).
+             FIX 2026-09-23 (modo bebidas). -->
+        <div class="bebidas-scene-layer" id="bebidasSceneLayer">
+          <svg class="bebidas-svg-layer" viewBox="0 0 200 280">
+            <!-- ============ MODO BEBIDAS: el viajero (vaso de botella cortada) ============
+                 Arte y coreografía de Exequiel (muestra 2026-09-23): bien de barrio.
+                 La coreografía del vaso va por JS (atributo transform: el WebView del J2
+                 no corre animaciones CSS sobre SVG); la de la cara va en CSS. Loop 12s. -->
+            <defs>
+              <linearGradient id="fernetLiquid" x1="0%" y1="0%" x2="100%" y2="100%">
+                <stop offset="0%" stop-color="#2c1407" />
+                <stop offset="65%" stop-color="#140702" />
+                <stop offset="100%" stop-color="#070200" />
+              </linearGradient>
+              <!-- Líquido dorado de cerveza rubia -->
+            <linearGradient id="beerGoldLiquid" x1="0%" y1="0%" x2="100%" y2="0%">
+              <stop offset="0%" stop-color="#b45309" />
+              <stop offset="25%" stop-color="#f59e0b" />
+              <stop offset="55%" stop-color="#fbbf24" />
+              <stop offset="85%" stop-color="#d97706" />
+              <stop offset="100%" stop-color="#78350f" />
+            </linearGradient>
+
+            <!-- Espuma cremosa blanca con sombras suaves -->
+            <linearGradient id="beerWhiteFoam" x1="0%" y1="0%" x2="0%" y2="100%">
+              <stop offset="0%" stop-color="#ffffff" />
+              <stop offset="60%" stop-color="#f8fafc" />
+              <stop offset="85%" stop-color="#e2e8f0" />
+              <stop offset="100%" stop-color="#fed7aa" />
+            </linearGradient>
+
+            <!-- Vidrio grueso facetado con reflejos cian neón -->
+            <linearGradient id="glassChoppBody" x1="0%" y1="0%" x2="100%" y2="0%">
+              <stop offset="0%" stop-color="#00f0ff" stop-opacity="0.55" />
+              <stop offset="22%" stop-color="#ffffff" stop-opacity="0.2" />
+              <stop offset="78%" stop-color="#00f0ff" stop-opacity="0.12" />
+              <stop offset="100%" stop-color="#00f0ff" stop-opacity="0.55" />
+            </linearGradient>
+              <linearGradient id="vinoLiquid" x1="0%" y1="0%" x2="100%" y2="100%">
+                <stop offset="0%" stop-color="#6b1a26" />
+                <stop offset="65%" stop-color="#3a0d16" />
+                <stop offset="100%" stop-color="#160408" />
+              </linearGradient>
+              <linearGradient id="foamFernet" x1="0%" y1="0%" x2="0%" y2="100%">
+                <stop offset="0%" stop-color="#fff5db" />
+                <stop offset="40%" stop-color="#e0bb6b" />
+                <stop offset="100%" stop-color="#7a4614" />
+              </linearGradient>
+              <linearGradient id="foamBirra" x1="0%" y1="0%" x2="0%" y2="100%">
+                <stop offset="0%" stop-color="#ffffff" />
+                <stop offset="45%" stop-color="#f2e2b8" />
+                <stop offset="100%" stop-color="#c99a5a" />
+              </linearGradient>
+              <linearGradient id="foamVino" x1="0%" y1="0%" x2="0%" y2="100%">
+                <stop offset="0%" stop-color="#e8a0a8" />
+                <stop offset="50%" stop-color="#a8505c" />
+                <stop offset="100%" stop-color="#5e2430" />
+              </linearGradient>
+              <!-- Tetra arremangado de vino con coca (arte de Exequiel 2026-09-23) -->
+              <linearGradient id="tetraCarton" x1="0%" y1="0%" x2="100%" y2="0%">
+                <stop offset="0%" stop-color="#3b020f" />
+                <stop offset="25%" stop-color="#69041b" />
+                <stop offset="70%" stop-color="#8a0725" />
+                <stop offset="100%" stop-color="#4a0213" />
+              </linearGradient>
+              <linearGradient id="aluminioInterior" x1="0%" y1="0%" x2="0%" y2="100%">
+                <stop offset="0%" stop-color="#ffffff" />
+                <stop offset="35%" stop-color="#cbd5e1" />
+                <stop offset="70%" stop-color="#94a3b8" />
+                <stop offset="100%" stop-color="#64748b" />
+              </linearGradient>
+              <linearGradient id="vinoConCoca" x1="0%" y1="0%" x2="100%" y2="100%">
+                <stop offset="0%" stop-color="#4a041c" />
+                <stop offset="35%" stop-color="#280210" />
+                <stop offset="70%" stop-color="#140108" />
+                <stop offset="100%" stop-color="#080003" />
+              </linearGradient>
+              <linearGradient id="espumaVinoCoca" x1="0%" y1="0%" x2="0%" y2="100%">
+                <stop offset="0%" stop-color="#fce7f3" />
+                <stop offset="35%" stop-color="#f43f5e" />
+                <stop offset="100%" stop-color="#881337" />
+              </linearGradient>
+              <linearGradient id="bottlePlastic" x1="0%" y1="0%" x2="100%" y2="0%">
+                <stop offset="0%" stop-color="rgba(0, 212, 255, 0.45)" />
+                <stop offset="25%" stop-color="rgba(0, 212, 255, 0.1)" />
+                <stop offset="75%" stop-color="rgba(0, 212, 255, 0.05)" />
+                <stop offset="100%" stop-color="rgba(0, 212, 255, 0.4)" />
+              </linearGradient>
+            </defs>
+
+            <!-- Grupo del viajero: el JS le setea transform+opacity por atributo en cada frame -->
+            <g id="viajeroGroup" opacity="0.95">
+              <!-- Cuerpo: botella de 2 litros cortada -->
+              <path d="M 120 198 C 120 196, 122 195, 125 195 L 161 195
+                       C 164 195, 166 196, 166 198 L 163 240
+                       C 162 254, 158 263, 143 263
+                       C 128 263, 124 254, 123 240 Z"
+                    fill="url(#bottlePlastic)" stroke="rgba(0, 212, 255, 0.6)" stroke-width="1.8" />
+              <!-- Cintura clásica de la botella de 2 litros -->
+              <path d="M 122 222 Q 143 226 164 222" fill="none" stroke="rgba(0, 212, 255, 0.25)" stroke-width="1.2" />
+              <path d="M 123 234 Q 143 238 163 234" fill="none" stroke="rgba(0, 212, 255, 0.2)" stroke-width="1" />
+              <!-- Líquido (el JS le cambia el fill según la bebida) -->
+              <path id="viajeroLiquid" d="M 122 208 L 164 208 L 162 240
+                       C 161 252, 157 260, 143 260
+                       C 129 260, 125 252, 124 240 Z"
+                    fill="url(#fernetLiquid)" />
+              <!-- Hielos -->
+              <polygon points="126,204 135,202 140,207 131,209" fill="rgba(0, 212, 255, 0.3)" stroke="#00d4ff" stroke-width="1.2" />
+              <polygon points="126,204 131,209 130,218 125,213" fill="rgba(0, 212, 255, 0.18)" stroke="#00d4ff" stroke-width="1.2" />
+              <polygon points="144,203 154,205 158,211 148,209" fill="rgba(0, 212, 255, 0.3)" stroke="#00d4ff" stroke-width="1.2" />
+              <!-- Corona de espuma, copete (el JS le cambia el fill según la bebida) -->
+              <path id="viajeroFoam" d="M 120 206
+                       C 122 201, 128 200, 131 204
+                       C 134 199, 142 198, 146 203
+                       C 150 199, 158 200, 161 204
+                       C 165 203, 166 207, 165 210
+                       C 162 214, 152 216, 143 216
+                       C 132 216, 122 214, 120 208 Z"
+                    fill="url(#foamFernet)" stroke="#ffe49e" stroke-width="1.2" />
+              <!-- Borde superior quemado con encendedor -->
+              <path d="M 121 196 Q 143 198 165 196" fill="none" stroke="#ffb703" stroke-width="2" stroke-linecap="round" opacity="0.85" />
+              <!-- Efervescencia (el JS les pulsa la opacidad) -->
+              <circle class="fizz-bubble" data-phase="0" cx="134" cy="226" r="1.5" fill="#ffdd80" />
+              <circle class="fizz-bubble" data-phase="0.33" cx="152" cy="230" r="1.2" fill="#ffdd80" />
+              <circle class="fizz-bubble" data-phase="0.66" cx="142" cy="220" r="1.8" fill="#ffdd80" />
+              <!-- Reflejo de luz en el plástico -->
+              <path d="M 124 204 L 126 248" fill="none" stroke="#ffffff" stroke-width="1.5" opacity="0.35" stroke-linecap="round" />
+            </g>
+
+            <!-- Chopp cervecero: el JS le setea transform+opacity por atributo en cada frame.
+                 El borde del vaso (142,200) es el pivote de la rotación: en el trago el
+                 borde va a la boca. ARTE DE EXEQUIEL 2026-09-24 (cerveza.html): tarro
+                 pesado con facetas talladas, manija de vidrio, birra rubia dorada,
+                 corona de espuma y burbujas. La animación CSS original no corría en el
+                 WebView viejo del J2 (ni alineaba el borde con la boca), así que va
+                 por JS como el resto. -->
+            <g id="choppGroup" opacity="0.95">
+            
+            <!-- 1. MANIJA GRUESA DE VIDRIO (A la derecha, robusta y ergonómica) -->
+            <path d="M 162 208 
+                     C 178 209, 180 222, 179 236 
+                     C 178 249, 174 255, 161 256" 
+                  fill="none" 
+                  stroke="#00f0ff" stroke-opacity="0.7" 
+                  stroke-width="5.5" 
+                  stroke-linecap="round" />
+            
+            <!-- Reflejo interior blanco en la manija -->
+            <path d="M 162 208 
+                     C 178 209, 180 222, 179 236 
+                     C 178 249, 174 255, 161 256" 
+                  fill="none" 
+                  stroke="#ffffff" 
+                  stroke-width="1.3" 
+                  stroke-linecap="round" 
+                  opacity="0.8" />
+
+            <!-- 2. SILUETA DEL CUERPO (Tarro cervecero pesado) -->
+            <!-- x: 122 a 163 (ancho 41px), y: 198 a 263 (alto 65px) -->
+            <path d="M 122 200 
+                     L 163 200 
+                     L 161 258 
+                     C 161 262, 158 264, 153 264 
+                     L 131 264 
+                     C 126 264, 123 262, 123 258 
+                     L 122 200 
+                     Z" 
+                  fill="url(#glassChoppBody)" 
+                  stroke="#00f0ff" stroke-opacity="0.75" 
+                  stroke-width="1.6" />
+
+            <!-- 3. BASE MACIZA DE VIDRIO ("Culote" grueso antideslizante) -->
+            <path d="M 124 255 L 160 255 L 159 262 L 125 262 Z" fill="#00f0ff" fill-opacity="0.25" stroke="#ffffff" stroke-opacity="0.4" stroke-width="0.9" />
+
+            <!-- 4. CONTENIDO: CERVEZA RUBIA DORADA HASTA 3/4 -->
+            <path d="M 123.5 211 
+                     L 161.5 211 
+                     L 159.5 255 
+                     L 124.5 255 
+                     Z" 
+                  fill="url(#beerGoldLiquid)" />
+
+            <!-- 5. FACETAS TALLADAS DEL VIDRIO (Canelones cóncavos clásicos de chopp) -->
+            <!-- Faceta 1 -->
+            <line x1="130" y1="211" x2="130" y2="255" stroke="#ffffff" stroke-opacity="0.25" stroke-width="1" />
+            <!-- Faceta 2 (Luz principal blanca) -->
+            <line x1="140" y1="211" x2="140" y2="255" stroke="#ffffff" stroke-width="1.4" opacity="0.75" />
+            <!-- Faceta 3 -->
+            <line x1="150" y1="211" x2="150" y2="255" stroke="#00f0ff" stroke-opacity="0.4" stroke-width="1.1" />
+            <!-- Faceta 4 -->
+            <line x1="156" y1="211" x2="156" y2="255" stroke="#ffffff" stroke-opacity="0.2" stroke-width="0.9" />
+
+            <!-- Arcos redondeados en la base de las facetas talladas -->
+            <path d="M 125 255 Q 128 252 131 255 Q 135 252 140 255 Q 145 252 150 255 Q 154 252 159 255" fill="none" stroke="#00f0ff" stroke-opacity="0.55" stroke-width="0.9" />
+
+            <!-- 6. CORONA DE ESPUMA VOLUPTUOSA (Grumosa y cremosa) -->
+            <path d="M 120 210 
+                     C 121 204, 127 202, 131 206 
+                     C 134 200, 143 199, 147 204 
+                     C 151 199, 159 201, 162 205 
+                     C 166 205, 167 209, 164 213 
+                     C 159 217, 149 219, 142 219 
+                     C 130 219, 121 217, 120 210 
+                     Z" 
+                  fill="url(#beerWhiteFoam)" 
+                  stroke="#ffffff" 
+                  stroke-width="1" />
+
+            <!-- Desborde / gota de espuma cayendo por el borde izquierdo -->
+            <path d="M 122 210 C 121 214, 122 219, 124 220 C 125 218, 126 215, 125 211 Z" fill="#ffffff" />
+
+            <!-- 7. BURBUJITAS ASCENDENTES DE GAS -->
+            <circle class="fizz-bubble" data-phase="0" cx="134" cy="248" r="1.2" fill="#ffffff" />
+            <circle class="fizz-bubble" data-phase="0.25" cx="145" cy="252" r="1" fill="#fff7ed" />
+            <circle class="fizz-bubble" data-phase="0.5" cx="152" cy="245" r="1.3" fill="#ffffff" />
+            <circle class="fizz-bubble" data-phase="0.75" cx="138" cy="235" r="0.9" fill="#fef08a" />
+
+            <!-- 8. CONDENSACIÓN Y REFLEJOS EN EL VIDRIO FRÍO -->
+            <path d="M 124 206 L 125 255" stroke="#ffffff" stroke-opacity="0.55" stroke-width="1.3" stroke-linecap="round" />
+            <circle cx="160" cy="226" r="1.1" fill="#ffffff" fill-opacity="0.85" />
+            <circle cx="126" cy="244" r="0.9" fill="#ffffff" fill-opacity="0.85" />
+
+            <!-- Borde superior labiado de vidrio -->
+            <ellipse cx="142" cy="200" rx="20.5" ry="3.2" fill="none" stroke="#00f0ff" stroke-width="1.5" />
+          </g>
+
+            <!-- Tetra arremangado de vino con coca: el JS le setea transform+opacity por atributo.
+                 El labio de aluminio (146,210) es el pivote de la rotación: en el trago va a la boca.
+                 Arte de Exequiel 2026-09-23 (adaptado al J2: sin var() en atributos ni filtros CSS). -->
+            <g id="tetraVasoGroup" opacity="0.95">
+              <!-- Resplandor perimetral exterior -->
+              <path d="M 124 207 L 168 207 L 164 262 L 128 262 Z"
+                    fill="none" stroke="rgba(0, 240, 255, 0.45)" stroke-width="2.4" />
+              <!-- Cuerpo del cartón cortado al medio -->
+              <rect x="127" y="208" width="38" height="53" rx="1.5" fill="url(#tetraCarton)" stroke="#a81335" stroke-width="1.2" />
+              <!-- Aristas y pliegues verticales del cartón -->
+              <line x1="130" y1="208" x2="130" y2="260" stroke="rgba(255, 255, 255, 0.2)" stroke-width="0.9" />
+              <line x1="162" y1="208" x2="162" y2="260" stroke="rgba(0, 0, 0, 0.45)" stroke-width="1" />
+              <!-- Franja blanca y sello -->
+              <rect x="128" y="222" width="36" height="24" fill="#f8fafc" />
+              <line x1="128" y1="223" x2="164" y2="223" stroke="#ffb703" stroke-width="1" />
+              <line x1="128" y1="245" x2="164" y2="245" stroke="#ffb703" stroke-width="1" />
+              <polygon points="128,233 164,225 164,231 128,239" fill="#8a0725" />
+              <circle cx="146" cy="233" r="2.8" fill="#ffb703" />
+              <circle cx="146" cy="233" r="1.6" fill="#540316" />
+              <!-- Costura sellada inferior -->
+              <line x1="127" y1="258" x2="165" y2="258" stroke="rgba(0, 0, 0, 0.7)" stroke-width="1.6" />
+              <!-- Vino con coca -->
+              <path d="M 128.5 214 L 163.5 214 L 163 258 L 129 258 Z" fill="url(#vinoConCoca)" />
+              <!-- Hielo -->
+              <polygon points="132,209 141,207 146,212 137,214" fill="rgba(0, 240, 255, 0.4)" stroke="#00f0ff" stroke-width="1.1" />
+              <polygon points="132,209 137,214 136,220 131,215" fill="rgba(0, 240, 255, 0.22)" stroke="#00f0ff" stroke-width="1.1" />
+              <!-- Corona de espuma fucsia -->
+              <path d="M 126 213
+                       C 128 208, 134 207, 137 211
+                       C 140 206, 147 205, 151 210
+                       C 155 206, 161 207, 164 211
+                       C 166 210, 167 213, 165 216
+                       C 161 219, 152 221, 146 221
+                       C 135 221, 127 219, 126 213 Z"
+                    fill="url(#espumaVinoCoca)" stroke="#fda4af" stroke-width="1.1" />
+              <!-- Arremangado: solapas dobladas hacia afuera mostrando el aluminio -->
+              <polygon points="127,208 123,212 127,216" fill="url(#aluminioInterior)" stroke="#ffffff" stroke-width="0.8" />
+              <polygon points="127,208 165,208 163,215 129,215" fill="url(#aluminioInterior)" stroke="rgba(0, 240, 255, 0.5)" stroke-width="0.9" />
+              <line x1="129" y1="208" x2="132" y2="215" stroke="#64748b" stroke-width="1" />
+              <line x1="163" y1="208" x2="160" y2="215" stroke="#64748b" stroke-width="1" />
+              <polygon points="165,208 169,212 165,216" fill="url(#aluminioInterior)" stroke="#ffffff" stroke-width="0.8" />
+              <!-- Labio de aluminio donde se toma -->
+              <line x1="128" y1="208" x2="164" y2="208" stroke="#ffffff" stroke-width="1.4" stroke-linecap="round" />
+              <!-- Burbujas (el JS les pulsa la opacidad) -->
+              <circle class="fizz-bubble" data-phase="0" cx="138" cy="235" r="1.3" fill="#fda4af" />
+              <circle class="fizz-bubble" data-phase="0.33" cx="154" cy="242" r="1.1" fill="#fce7f3" />
+              <circle class="fizz-bubble" data-phase="0.66" cx="145" cy="227" r="1.5" fill="#fda4af" />
+            </g>
+
+          </svg>
+        </div>
+      </div>
       </div>
 
       <!-- Medidor de paciencia y desgano en modo rebelde -->
@@ -199,29 +518,24 @@
         <span class="face-speech-text" id="faceSpeechText">¡Hola che! Soy Titán. Tocame o decí "Titán" para hablarme.</span>
       </div>
 
-      <!-- Botones Flotantes Discretos de Control (Accesibles siempre, incluso en Pantalla Completa) -->
+      <!-- Botón flotante de pantalla completa: única salida en modo fullscreen (2026-09-17) -->
       <div class="floating-controls" id="floatingControls">
-        <button class="btn-float" id="btnFloatMuteAudio" title="Voz silenciada en esta pantalla (sale por Servidor Titán DDR3). Clic para escucharla acá.">🔇</button>
-        <button class="btn-float" id="btnFloatHandsFree" title="Alternar Manos Libres">👂</button>
-        <button class="btn-float" id="btnFloatFullscreen" title="Pantalla Completa">⛶</button>
+        <button class="btn-float" id="btnFloatFullscreen" title="Pantalla Completa" aria-label="Pantalla Completa">⛶</button>
       </div>
 
-      <!-- Controles Rápidos de la Cara -->
+      <!-- Controles Rápidos de la Cara: hablar, ojos y parlante (2026-09-17) -->
       <div class="face-quick-actions">
         <button class="btn-face-action" id="btnFaceMic">
           <span>🎙</span>
           <span>HABLAR</span>
         </button>
 
-        <button class="btn-face-action" id="btnHandsFree" title="Activar escucha continua por voz">
-          <span id="handsFreeIcon">👂</span>
-          <span id="handsFreeLabel">MANOS LIBRES</span>
-        </button>
-
         <button class="btn-face-action" id="btnToggleCamera">
           <span>👁</span>
           <span id="camBtnLabel">OJOS</span>
         </button>
+
+        <button class="btn-face-action btn-icon-only" id="btnFloatMuteAudio" title="Voz silenciada en esta pantalla (sale por Servidor Titán DDR3). Clic para escucharla acá." aria-label="Voz silenciada en esta pantalla (sale por Servidor Titán DDR3). Clic para escucharla acá.">🔇</button>
       </div>
 
       <!-- Visor de Cámara Flotante ("Los Ojos de Gemini") -->
@@ -229,13 +543,13 @@
         <div class="visor-header">
           <span>👁 OJOS DEL ASISTENTE</span>
           <div class="visor-header-actions">
-            <button class="btn-visor-flip" id="btnFlipCamera" title="Cambiar Cámara (Frontal / Trasera)">🔄</button>
-            <button class="btn-visor-close" id="btnCloseCamera">✕</button>
+            <button class="btn-visor-flip" id="btnFlipCamera" title="Cambiar Cámara (Frontal / Trasera)" aria-label="Cambiar Cámara (Frontal / Trasera)">🔄</button>
+            <button class="btn-visor-close" id="btnCloseCamera" aria-label="Cerrar cámara">✕</button>
           </div>
         </div>
         <div class="visor-video-wrapper">
           <video id="cameraVideo" autoplay playsinline muted></video>
-          <canvas id="cameraCanvas" style="display:none;"></canvas>
+          <canvas id="cameraCanvas" style="display:none;" aria-hidden="true"></canvas>
           <input type="file" id="cameraFileInput" accept="image/*" capture="user" style="display:none;">
           <div class="visor-crosshair"></div>
         </div>
@@ -320,7 +634,7 @@
 
         <!-- Barra de Entrada Manual de Comandos -->
         <form class="command-bar" id="commandForm">
-          <button type="button" class="btn-cmd-art" id="btnToggleImageMode" title="Pedir a Titán que dibuje o cree una imagen con IA">🎨</button>
+          <button type="button" class="btn-cmd-art" id="btnToggleImageMode" title="Pedir a Titán que dibuje o cree una imagen con IA" aria-label="Pedir a Titán que dibuje o cree una imagen con IA">🎨</button>
           <input 
             type="text" 
             id="cmdInput" 
@@ -588,7 +902,7 @@
     <div class="modal-card">
       <div class="modal-header">
         <h3>CONFIGURACIÓN DEL ASISTENTE</h3>
-        <button class="btn-close" id="btnCloseModal">✕</button>
+        <button class="btn-close" id="btnCloseModal" aria-label="Cerrar ventana">✕</button>
       </div>
       <div class="modal-body">
         <label for="apiKeyInput">Google Gemini API Key:</label>
@@ -606,12 +920,12 @@
   <!-- Modal de Imagen en Pantalla Completa (Lightbox) -->
   <div class="image-lightbox-modal" id="imageLightboxModal">
     <div class="lightbox-content">
-      <button type="button" class="lightbox-close-btn" id="btnCloseLightbox" title="Cerrar">✕</button>
+      <button type="button" class="lightbox-close-btn" id="btnCloseLightbox" title="Cerrar" aria-label="Cerrar">✕</button>
       <img id="lightboxImg" src="" alt="Imagen IA">
       <div class="lightbox-caption" id="lightboxCaption" style="margin-top: 0.8rem; color: #fff; font-size: 0.9rem; text-align: center; max-width: 90%;"></div>
     </div>
   </div>
 
-  <script src="/static/app.js?v=50"></script>
+  <script src="/static/app.js?v=67"></script>
 </body>
 </html>

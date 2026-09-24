@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import json
 import time
 from urllib.parse import urljoin, urlparse
 from pathlib import Path
@@ -11,10 +12,11 @@ from pydantic import BaseModel, Field
 
 from core.config import config
 from core.state_manager import state_mgr, AssistantState
-from core.logger import log_info, log_error
+from core.logger import log_info, log_error, log_warning
 from core.security import authorize_http, authorize_websocket, device_auth_is_required, device_is_valid, token_is_valid
 from core.device_registry import registry
 from core.pairing import pairing_manager
+from core.rate_limit import RateLimiter
 from server.websocket_hub import ws_hub
 from tools.system_control import system_control
 from tools.app_launcher import app_launcher
@@ -22,6 +24,75 @@ from tools.app_launcher import app_launcher
 from starlette.middleware.base import BaseHTTPMiddleware
 
 app = FastAPI(title="Asistente de Voz Local - HUD Pantalla Secundaria")
+
+
+# R-7: límite de tamaño de payloads HTTP (DoS local). Los modelos Pydantic
+# validan DESPUÉS de leer el body completo en memoria: sin este freno, un
+# body gigante (ej. 2 GB a /api/chat) se buferiza entero antes de ser
+# rechazado por max_length. El tope cubre el endpoint más grande
+# (/api/vision/analyze con image_base64 de hasta 16 MB) más overhead JSON.
+MAX_HTTP_BODY_BYTES = 20 * 1024 * 1024
+# R-7: tope de mensaje de texto en el WS principal. Los mensajes de control
+# (prompts, triggers, telemetría) son chicos; el micrófono ya tenía su tope
+# propio (MAX_MIC_CHUNK_BYTES).
+WS_MAX_TEXT_BYTES = 1 * 1024 * 1024
+
+
+class MaxBodySizeMiddleware:
+    """Middleware ASGI puro: rechaza con 413 los bodies que superen el tope.
+
+    Con content-length se rechaza sin leer nada; sin content-length
+    (chunked) se buferiza acotado al tope y se reinyecta el body para que el
+    endpoint lo lea normal. Nunca se retiene más del tope en memoria.
+    """
+
+    def __init__(self, app, max_bytes: int = MAX_HTTP_BODY_BYTES):
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope.get("method") in ("POST", "PUT", "PATCH"):
+            headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope.get("headers", [])}
+            clen = headers.get("content-length")
+            if clen is not None:
+                try:
+                    if int(clen) > self.max_bytes:
+                        resp = JSONResponse(status_code=413, content={"detail": "Payload demasiado grande"})
+                        await resp(scope, receive, send)
+                        return
+                except ValueError:
+                    pass
+            else:
+                # Sin content-length: leer acotado y reinyectar.
+                chunks = []
+                total = 0
+                while True:
+                    message = await receive()
+                    if message["type"] == "http.disconnect":
+                        return
+                    if message["type"] != "http.request":
+                        continue
+                    chunk = message.get("body", b"")
+                    total += len(chunk)
+                    if total > self.max_bytes:
+                        resp = JSONResponse(status_code=413, content={"detail": "Payload demasiado grande"})
+                        await resp(scope, receive, send)
+                        return
+                    chunks.append(chunk)
+                    if not message.get("more_body", False):
+                        break
+                body = b"".join(chunks)
+
+                async def replay_receive():
+                    return {"type": "http.request", "body": body, "more_body": False}
+
+                await self.app(scope, replay_receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(MaxBodySizeMiddleware)
+
 
 class NoCacheMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
@@ -34,14 +105,69 @@ class NoCacheMiddleware(BaseHTTPMiddleware):
 app.add_middleware(NoCacheMiddleware)
 
 
-class ApiAuthMiddleware(BaseHTTPMiddleware):
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    """S-8: headers de seguridad HTTP en todas las respuestas.
+
+    El CSP permite los scripts inline (admin.html e index.html los usan),
+    el CDN de jsdelivr y Google Fonts que ya usa el HUD, y data: para el
+    QR de emparejamiento; bloquea object-src, base-uri ajena y framing
+    cruzado (reforzado también con X-Frame-Options).
+    """
     async def dispatch(self, request, call_next):
-        if request.url.path.startswith("/api/") and request.url.path != "/api/pair/claim":
-            authorize_http(request)
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "SAMEORIGIN"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; "
+            "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+            "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+            "font-src 'self' https://fonts.gstatic.com; "
+            "img-src 'self' data:; "
+            "media-src 'self' blob:; "
+            "connect-src 'self' ws: wss:; "
+            "object-src 'none'; "
+            "base-uri 'self'; "
+            "frame-ancestors 'self'"
+        )
+        return response
+
+
+app.add_middleware(SecurityHeadersMiddleware)
+
+
+class AuthMiddleware(BaseHTTPMiddleware):
+    """P0: exige autenticación en /api/* (salvo /api/pair/claim) y en /static/*.
+
+    Las páginas /pair y /healthz quedan públicas a propósito: /pair es la
+    puerta de entrada para emparejar un dispositivo nuevo con el código de
+    6 dígitos, y /healthz es solo para monitoreo.
+
+    Nota: la excepción de authorize_http se convierte acá en respuesta 401,
+    porque los middlewares corren por fuera del manejador de excepciones
+    del router y si no el cliente recibiría un 500.
+    """
+    async def dispatch(self, request, call_next):
+        path = request.url.path
+        needs_auth = (path.startswith("/api/") and path != "/api/pair/claim") or path.startswith("/static/")
+        if needs_auth:
+            try:
+                authorize_http(request)
+            except HTTPException as exc:
+                return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
         return await call_next(request)
 
 
-app.add_middleware(ApiAuthMiddleware)
+app.add_middleware(AuthMiddleware)
+
+# P0: cookies de dispositivos emparejados con validez larga (1 año). El J2 y
+# otros HUD quedan siempre prendidos; una sesión de 24 h obligaría a
+# re-emparejar a mano cada día. La revocación se hace desde /admin en
+# cualquier momento.
+DEVICE_COOKIE_MAX_AGE = 365 * 24 * 3600
+
+# P0: freno de fuerza bruta para /api/pair/claim (código de 6 dígitos).
+_pair_limiter = RateLimiter(max_attempts=5, window_seconds=600, lockout_seconds=600)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
@@ -97,7 +223,14 @@ async def websocket_endpoint(websocket: WebSocket):
     try:
         while True:
             # Escuchar mensajes enviados desde la interfaz web (botones, triggers, prompts)
-            data = await websocket.receive_json()
+            # R-7: tope de tamaño antes de parsear; sin esto un mensaje gigante
+            # se buferiza y parsea entero en memoria (DoS local).
+            raw = await websocket.receive_text()
+            if len(raw.encode("utf-8")) > WS_MAX_TEXT_BYTES:
+                log_warning("[Seguridad] Mensaje WS descartado por tamaño.")
+                await websocket.close(code=1009, reason="Mensaje demasiado grande")
+                break
+            data = json.loads(raw)
             msg_type = data.get("type")
             
             if msg_type == "register_satellite":
@@ -108,10 +241,31 @@ async def websocket_endpoint(websocket: WebSocket):
                     await websocket.close(code=1008, reason="Token de satélite inválido")
                     return
                 ws_hub.register_satellite(websocket, data)
+                # P0-4 — Autenticación mutua: el satélite desafía al servidor
+                # a probar que conoce el token (challenge-response HMAC).
+                # Sin este proof, un servidor impostor en la LAN podría
+                # darle órdenes al satélite y este las obedecería a ciegas.
+                # Además se guarda el token de esta conexión para firmar
+                # cada remote_exec (se borra al desconectar).
+                nonce = data.get("auth_nonce", "")
+                if nonce and token:
+                    from core import rpc_auth
+                    ws_hub.connection_meta[websocket]["rpc_token"] = token
+                    await websocket.send_json({
+                        "type": "satellite_auth_ok",
+                        "server_proof": rpc_auth.server_proof(token, nonce),
+                    })
             elif msg_type == "satellite_telemetry":
-                metrics = data.get("metrics", {})
-                hostname = data.get("hostname", "Windows-PC")
-                ws_hub.update_satellite_metrics(metrics, meta={"hostname": hostname})
+                # S-7: la telemetría solo la puede reportar un satélite
+                # registrado (pasó por register_satellite con token válido).
+                # Antes cualquier cliente WS autenticado (ej. un navegador
+                # con token de HUD) podía inyectar métricas falsas.
+                if websocket not in ws_hub.satellite_connections:
+                    log_warning("[Seguridad] Telemetría descartada: el remitente no es un satélite registrado.")
+                else:
+                    metrics = data.get("metrics", {})
+                    hostname = data.get("hostname", "Windows-PC")
+                    ws_hub.update_satellite_metrics(metrics, meta={"hostname": hostname})
             elif msg_type == "record_activity":
                 state_mgr.record_activity(trigger_wake=bool(data.get("trigger_wake", True)))
             elif msg_type == "trigger_listen":
@@ -154,14 +308,26 @@ async def websocket_endpoint(websocket: WebSocket):
                 from tools.j2_camera import j2_camera
                 j2_camera.handle_photo_result(data)
             elif msg_type == "cool_down_pc":
-                from tools.system_control import system_control
-                res = system_control.cool_down_pc()
-                await websocket.send_json({"type": "thermal_action_result", "action": "cool_down_pc", "result": res})
+                # P0-5 — En modos restrictivos (rebelde/pibes) no se ejecutan acciones.
+                from core.mode_policy import actions_blocked
+                if actions_blocked():
+                    await websocket.send_json({"type": "thermal_action_result", "action": "cool_down_pc",
+                                               "result": {"status": "error", "message": "Bloqueado por el modo activo."}})
+                else:
+                    from tools.system_control import system_control
+                    res = system_control.cool_down_pc()
+                    await websocket.send_json({"type": "thermal_action_result", "action": "cool_down_pc", "result": res})
             elif msg_type == "set_power_plan":
-                plan = data.get("plan_mode", "balanced")
-                from tools.system_control import system_control
-                res = system_control.set_power_plan(plan)
-                await websocket.send_json({"type": "thermal_action_result", "action": "set_power_plan", "result": res})
+                # P0-5 — En modos restrictivos (rebelde/pibes) no se ejecutan acciones.
+                from core.mode_policy import actions_blocked
+                if actions_blocked():
+                    await websocket.send_json({"type": "thermal_action_result", "action": "set_power_plan",
+                                               "result": {"status": "error", "message": "Bloqueado por el modo activo."}})
+                else:
+                    plan = data.get("plan_mode", "balanced")
+                    from tools.system_control import system_control
+                    res = system_control.set_power_plan(plan)
+                    await websocket.send_json({"type": "thermal_action_result", "action": "set_power_plan", "result": res})
             elif msg_type == "rpc_reply":
                 # El satélite Windows respondió a una llamada RPC remota
                 request_id = data.get("request_id", "")
@@ -187,13 +353,21 @@ async def websocket_endpoint(websocket: WebSocket):
                         spoken_msg = f"¡Listo, papá! Ahí te generé la imagen de {prompt_text}. La podés ver y descargar en la pantalla de Control."
                         asyncio.create_task(tts.speak(spoken_msg))
     except WebSocketDisconnect:
-        ws_hub.disconnect(websocket)
+        pass  # desconexión limpia: el finally de abajo la registra
     except Exception as e:
         log_error(f"Error en socket: {e}")
+    finally:
+        # F6: desconectar SIEMPRE, también si el handler salió con break
+        # (mensaje gigante, close 1009) o return (token de satélite inválido,
+        # close 1008). Antes esos caminos dejaban el socket muerto en
+        # active_connections y su connection_meta colgada para siempre.
         ws_hub.disconnect(websocket)
 
 latest_mic_id: int = 0
 active_mic_count: int = 0
+# F5: el chequeo del tope y el incremento no eran atómicos (había un await
+# en el medio): dos celulares conectando a la vez podían colarse los dos.
+_mic_lock = asyncio.Lock()
 
 def has_active_mobile_mic() -> bool:
     global active_mic_count
@@ -203,13 +377,14 @@ def has_active_mobile_mic() -> bool:
 async def websocket_mic_endpoint(websocket: WebSocket):
     global latest_mic_id, active_mic_count
     await authorize_websocket(websocket, role="api")
-    if active_mic_count >= MAX_ACTIVE_MICS:
-        await websocket.close(code=1013, reason="Límite de micrófonos alcanzado")
-        return
-    await websocket.accept()
-    latest_mic_id += 1
-    active_mic_count += 1
-    my_id = latest_mic_id
+    async with _mic_lock:
+        if active_mic_count >= MAX_ACTIVE_MICS:
+            await websocket.close(code=1013, reason="Límite de micrófonos alcanzado")
+            return
+        await websocket.accept()
+        latest_mic_id += 1
+        active_mic_count += 1
+        my_id = latest_mic_id
     log_info(f"[Mic Celular] Transmisión #{my_id} conectada vía WebSocket (Activos: {active_mic_count})")
     from audio.stream_listener import stream_listener
     try:
@@ -238,7 +413,10 @@ async def analyze_vision_endpoint(data: VisionRequest):
         asyncio.create_task(tts.speak(reply))
         return {"status": "success", "reply": reply}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        # S-MED-8: no exponer el detalle interno (puede traer fragmentos de
+        # la API o trazas); se loguea en el servidor y se devuelve genérico.
+        log_error(f"[Vision] /api/vision/analyze falló: {e!r}")
+        raise HTTPException(status_code=500, detail="Error interno analizando la imagen.")
 
 @app.get("/api/status")
 async def get_status():
@@ -311,7 +489,9 @@ async def pc_screen_analyze_endpoint(req: ScreenAnalyzeRequest = ScreenAnalyzeRe
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        # S-MED-8: no exponer el detalle interno; se loguea en el servidor.
+        log_error(f"[Vision] analyze-screen falló: {e!r}")
+        raise HTTPException(status_code=500, detail="Error interno analizando la pantalla.")
 
 @app.post("/api/image/generate")
 async def generate_image_endpoint(req: ImageGenerateRequest):
@@ -352,14 +532,38 @@ async def generate_image_endpoint(req: ImageGenerateRequest):
     else:
         raise HTTPException(status_code=500, detail=res.get("message", "Error generando imagen"))
 
+def validate_wallpaper_url(image_url: str) -> str:
+    """P0-4 — Valida la URL de imagen para /api/pc/wallpaper/set.
+
+    Acepta rutas locales del propio servidor ("/...": imágenes generadas
+    por Titán) o URLs http/https con host. Rechaza otros esquemas
+    (file://, ftp://, javascript:, ...) y URLs absurdamente largas.
+    Devuelve la URL normalizada o lanza ValueError.
+    """
+    url = (image_url or "").strip()
+    if not url:
+        raise ValueError("Falta el parámetro image_url")
+    if len(url) > 2048:
+        raise ValueError("URL de imagen demasiado larga")
+    if url.startswith("/"):
+        return url  # imagen generada por el propio servidor
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError("URL de imagen inválida: solo se permiten http/https")
+    return url
+
+
 @app.post("/api/pc/wallpaper/set")
 async def pc_set_wallpaper(data: Dict[str, Any]):
     from server.websocket_hub import ws_hub
     if not ws_hub.has_windows_satellite():
         raise HTTPException(status_code=503, detail="La PC Principal (Windows) no está conectada.")
     img_url = data.get("image_url", "")
-    if not img_url:
-        raise HTTPException(status_code=400, detail="Falta el parámetro image_url")
+    # P0-4 — Validar la URL antes de pedirle al satélite que la descargue.
+    try:
+        img_url = validate_wallpaper_url(img_url)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     if img_url.startswith("/"):
         host_ip = "192.168.100.5"
         try:
@@ -475,7 +679,7 @@ async def health_check():
 
 @app.get("/api/admin/devices")
 async def admin_list_devices(request: Request):
-    authorize_http(request)
+    authorize_http(request, role="admin")
     return {
         "registered": registry.list_devices(),
         "connected": ws_hub.list_connections(),
@@ -484,10 +688,11 @@ async def admin_list_devices(request: Request):
 
 @app.post("/api/admin/devices/enroll")
 async def admin_enroll_device(payload: dict, request: Request):
-    authorize_http(request)
+    authorize_http(request, role="admin")
     device_id = str(payload.get("device_id", "")).strip()
     roles = payload.get("roles", [])
-    if not isinstance(roles, list) or not all(role in {"api", "satellite"} for role in roles):
+    # S-4: existe el rol "admin"; solo un admin puede enrolar.
+    if not isinstance(roles, list) or not all(role in {"api", "satellite", "admin"} for role in roles):
         raise HTTPException(status_code=400, detail="Roles inválidos")
     try:
         token, device = registry.enroll(device_id, roles)
@@ -498,7 +703,9 @@ async def admin_enroll_device(payload: dict, request: Request):
     parsed = urlparse(base_url)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise HTTPException(status_code=400, detail="La dirección de Titán no es válida")
-    pairing_url = f"{base_url}/?device_id={device_id}&token={token}"
+    # P0: la URL de emparejamiento YA NO lleva el token en el query string
+    # (queda en historial y logs). Se ingresa el código en /pair.
+    pairing_url = f"{base_url}/pair"
     qr_data_uri = None
     try:
         import io
@@ -520,20 +727,39 @@ async def admin_enroll_device(payload: dict, request: Request):
 
 
 @app.post("/api/pair/claim")
-async def claim_pairing_code(pairing: PairingClaim):
+async def claim_pairing_code(pairing: PairingClaim, request: Request):
+    # P0: rate limiting por IP contra fuerza bruta del código de 6 dígitos.
+    client_ip = request.client.host if request.client else "desconocida"
+    if _pair_limiter.is_blocked(client_ip):
+        raise HTTPException(
+            status_code=429,
+            detail="Demasiados intentos fallidos. Probá de nuevo más tarde.",
+            headers={"Retry-After": str(_pair_limiter.retry_after(client_ip))},
+        )
     claimed = pairing_manager.claim(pairing.code)
     if not claimed:
+        _pair_limiter.register_failure(client_ip)
         raise HTTPException(status_code=401, detail="Código inválido o vencido")
-    device_id, token = claimed
+    _pair_limiter.register_success(client_ip)
+
+    if claimed["kind"] == "setup":
+        # Código de configuración inicial: enrolar un dispositivo nuevo.
+        import secrets as _secrets
+        device_id = f"navegador-{_secrets.token_hex(3)}"
+        token, _device = registry.enroll(device_id, claimed["roles"])
+        log_info(f"[Seguridad] Dispositivo enrolado con código de configuración inicial: {device_id}")
+    else:
+        device_id, token = claimed["device_id"], claimed["token"]
+
     response = RedirectResponse(url="/", status_code=303)
-    response.set_cookie("titan_token", token, httponly=True, samesite="strict", max_age=86400)
-    response.set_cookie("titan_device_id", device_id, httponly=True, samesite="strict", max_age=86400)
+    response.set_cookie("titan_token", token, httponly=True, samesite="strict", max_age=DEVICE_COOKIE_MAX_AGE)
+    response.set_cookie("titan_device_id", device_id, httponly=True, samesite="strict", max_age=DEVICE_COOKIE_MAX_AGE)
     return response
 
 
 @app.post("/api/admin/devices/{device_id}/revoke")
 async def admin_revoke_device(device_id: str, request: Request):
-    authorize_http(request)
+    authorize_http(request, role="admin")
     if not registry.revoke(device_id):
         raise HTTPException(status_code=404, detail="Dispositivo no encontrado")
     return {"status": "success", "device_id": device_id, "enabled": False}
@@ -543,48 +769,24 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 @app.get("/")
 async def serve_index(request: Request):
+    # P0: el HUD exige autenticación. Sin cookie de dispositivo emparejado
+    # no se sirve la página (antes era pública para toda la LAN).
+    # P0: ya no se aceptan tokens en el query string.
+    authorize_http(request)
     index_path = STATIC_DIR / "index.html"
     if index_path.exists():
-        response = FileResponse(index_path)
-        token = request.query_params.get("token", "").strip()
-        device_id = request.query_params.get("device_id", "").strip()
-        if token and (token_is_valid(token, "api") or device_is_valid(device_id, token, ("api",))):
-            response.set_cookie(
-                "titan_token",
-                token,
-                httponly=True,
-                samesite="strict",
-                secure=request.url.scheme == "https",
-                max_age=86400,
-            )
-        if device_id:
-            response.set_cookie(
-                "titan_device_id",
-                device_id,
-                httponly=True,
-                samesite="strict",
-                secure=request.url.scheme == "https",
-                max_age=86400,
-            )
-        return response
+        return FileResponse(index_path)
     return JSONResponse({"message": "HUD Frontend no encontrado en /static"})
 
 
 @app.get("/admin")
 async def serve_admin(request: Request):
+    # P0: sin bypass de loopback. El panel admin exige autenticación siempre.
+    # S-4: además exige rol "admin" (un HUD común ya no puede ni verlo).
+    authorize_http(request, role="admin")
     admin_path = STATIC_DIR / "admin.html"
     if admin_path.exists():
-        token = request.query_params.get("token", "").strip()
-        device_id = request.query_params.get("device_id", "").strip()
-        if request.client and request.client.host not in {"127.0.0.1", "::1", "localhost"}:
-            if not device_is_valid(device_id, token, ("api",)) and not token_is_valid(token, "api"):
-                raise HTTPException(status_code=401, detail="Panel administrativo no autorizado")
-        response = FileResponse(admin_path)
-        if token:
-            response.set_cookie("titan_token", token, httponly=True, samesite="strict", secure=request.url.scheme == "https", max_age=86400)
-        if device_id:
-            response.set_cookie("titan_device_id", device_id, httponly=True, samesite="strict", secure=request.url.scheme == "https", max_age=86400)
-        return response
+        return FileResponse(admin_path)
     return JSONResponse({"message": "Gestor de dispositivos no encontrado"}, status_code=404)
 
 
